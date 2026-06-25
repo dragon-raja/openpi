@@ -4,12 +4,12 @@ import asyncio
 import concurrent.futures as futures
 import dataclasses
 import logging
+import os
 from typing import Protocol
 
 from etils import epath
 import jax
 import orbax.checkpoint as ocp
-import orbax.checkpoint.future as future
 
 from openpi.shared import array_typing as at
 import openpi.shared.normalize as _normalize
@@ -37,6 +37,8 @@ def initialize_checkpoint_dir(
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    enable_async_checkpointing = os.environ.get("OPENPI_ASYNC_CHECKPOINT", "0") == "1"
+
     mngr = ocp.CheckpointManager(
         checkpoint_dir,
         item_handlers={
@@ -48,7 +50,9 @@ def initialize_checkpoint_dir(
             max_to_keep=1,
             keep_period=keep_period,
             create=False,
-            async_options=ocp.AsyncOptions(timeout_secs=7200),
+            cleanup_tmp_directories=True,
+            enable_async_checkpointing=enable_async_checkpointing,
+            async_options=ocp.AsyncOptions(timeout_secs=7200) if enable_async_checkpointing else None,
         ),
     )
 
@@ -126,7 +130,8 @@ class CallbackHandler(ocp.AsyncCheckpointHandler):
             args.callback(directory)
 
     async def async_save(self, directory: epath.Path, args: CallbackSave) -> list[futures.Future]:
-        return [future.CommitFutureAwaitingContractedSignals(asyncio.to_thread(self.save, directory, args))]
+        await asyncio.to_thread(self.save, directory, args)
+        return []
 
     def restore(self, *args, **kwargs):
         raise NotImplementedError("CallbackHandler does not support restore")

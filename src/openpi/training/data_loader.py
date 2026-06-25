@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
+from datasets import DownloadConfig
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -37,6 +38,29 @@ class IterableDataset(Protocol[T_co]):
 
     def __len__(self) -> int:
         raise NotImplementedError("Subclasses of Dataset should implement __len__.")
+
+
+def _lerobot_root_for_repo(repo_id: str) -> str | None:
+    root = os.environ.get("OPENPI_LEROBOT_ROOT") or os.environ.get("PI05_LEROBOT_ROOT")
+    if repo_id == "physical-intelligence/libero" and root:
+        return root
+    return None
+
+
+def _patch_lerobot_parquet_loader() -> None:
+    if os.environ.get("OPENPI_DISABLE_LEROBOT_PARQUET_PATCH") == "1":
+        return
+    original_load_dataset = lerobot_dataset.load_dataset
+    if getattr(original_load_dataset, "_openpi_no_extract_patch", False):
+        return
+
+    def load_dataset_no_extract(*args, **kwargs):
+        if args and args[0] == "parquet" and "download_config" not in kwargs:
+            kwargs["download_config"] = DownloadConfig(extract_compressed_file=False)
+        return original_load_dataset(*args, **kwargs)
+
+    load_dataset_no_extract._openpi_no_extract_patch = True
+    lerobot_dataset.load_dataset = load_dataset_no_extract
 
 
 class DataLoader(Protocol[T_co]):
@@ -137,9 +161,15 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_root = _lerobot_root_for_repo(repo_id)
+    if dataset_root:
+        logging.info("Using LeRobot dataset root for %s: %s", repo_id, dataset_root)
+
+    _patch_lerobot_parquet_loader()
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=dataset_root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=dataset_root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
