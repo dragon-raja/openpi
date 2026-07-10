@@ -41,10 +41,24 @@ class IterableDataset(Protocol[T_co]):
 
 
 def _lerobot_root_for_repo(repo_id: str) -> str | None:
+    if repo_id.startswith("robocasa/"):
+        return os.environ.get("OPENPI_ROBOCASA_LEROBOT_ROOT") or os.environ.get("ROBOCASA_LEROBOT_ROOT")
+
     root = os.environ.get("OPENPI_LEROBOT_ROOT") or os.environ.get("PI05_LEROBOT_ROOT")
     if repo_id == "physical-intelligence/libero" and root:
         return root
     return None
+
+
+def _lerobot_video_backend_for_repo(repo_id: str) -> str | None:
+    if repo_id.startswith("robocasa/"):
+        return (
+            os.environ.get("OPENPI_ROBOCASA_VIDEO_BACKEND")
+            or os.environ.get("ROBOCASA_LEROBOT_VIDEO_BACKEND")
+            or os.environ.get("OPENPI_LEROBOT_VIDEO_BACKEND")
+            or "pyav"
+        )
+    return os.environ.get("OPENPI_LEROBOT_VIDEO_BACKEND")
 
 
 def _patch_lerobot_parquet_loader() -> None:
@@ -164,12 +178,16 @@ def create_torch_dataset(
     dataset_root = _lerobot_root_for_repo(repo_id)
     if dataset_root:
         logging.info("Using LeRobot dataset root for %s: %s", repo_id, dataset_root)
+    video_backend = _lerobot_video_backend_for_repo(repo_id)
+    if video_backend:
+        logging.info("Using LeRobot video backend for %s: %s", repo_id, video_backend)
 
     _patch_lerobot_parquet_loader()
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=dataset_root)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
         root=dataset_root,
+        video_backend=video_backend,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
