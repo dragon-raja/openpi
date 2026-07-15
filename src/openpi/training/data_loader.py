@@ -41,6 +41,8 @@ class IterableDataset(Protocol[T_co]):
 
 
 def _lerobot_root_for_repo(repo_id: str) -> str | None:
+    if repo_id.startswith("iantc104/gv_sim_"):
+        return os.environ.get("OPENPI_AV_ALOHA_LEROBOT_ROOT")
     if repo_id.startswith("robocasa/"):
         return os.environ.get("OPENPI_ROBOCASA_LEROBOT_ROOT") or os.environ.get("ROBOCASA_LEROBOT_ROOT")
 
@@ -51,6 +53,8 @@ def _lerobot_root_for_repo(repo_id: str) -> str | None:
 
 
 def _lerobot_video_backend_for_repo(repo_id: str) -> str | None:
+    if repo_id.startswith("iantc104/gv_sim_"):
+        return os.environ.get("OPENPI_AV_ALOHA_VIDEO_BACKEND") or "pyav"
     if repo_id.startswith("robocasa/"):
         return (
             os.environ.get("OPENPI_ROBOCASA_VIDEO_BACKEND")

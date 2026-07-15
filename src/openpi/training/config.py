@@ -18,6 +18,7 @@ import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
+import openpi.policies.av_aloha_policy as av_aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.robocasa_policy as robocasa_policy
@@ -275,6 +276,51 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
             repack_transforms=self.repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotAvAlohaMotorDataConfig(DataConfigFactory):
+    """Train fixed-camera task-arm candidates from AV-ALOHA demonstrations."""
+
+    use_delta_joint_actions: bool = True
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transforms = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "overhead_cam": "observation.images.overhead_cam",
+                            "wrist_cam_left": "observation.images.wrist_cam_left",
+                            "wrist_cam_right": "observation.images.wrist_cam_right",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[av_aloha_policy.AvAlohaMotorInputs()],
+            outputs=[av_aloha_policy.AvAlohaMotorOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
             action_sequence_keys=self.action_sequence_keys,
         )
 
@@ -864,6 +910,30 @@ _CONFIGS = [
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_av_aloha_sewneedle_motor_v0",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotAvAlohaMotorDataConfig(
+            repo_id="iantc104/gv_sim_sew_needle_3arms",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        batch_size=32,
+        num_workers=4,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=500,
+            peak_lr=2.5e-5,
+            decay_steps=20_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=20_000,
+        save_interval=1_000,
+        keep_period=10_000,
+        fsdp_devices=4,
     ),
     #
     # Fine-tuning Aloha configs.
