@@ -5,6 +5,7 @@ from collections.abc import Sequence
 import dataclasses
 import difflib
 import logging
+import os
 import pathlib
 from typing import Any, Literal, Protocol, TypeAlias
 
@@ -928,7 +929,10 @@ _CONFIGS = [
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
+            os.environ.get(
+                "OPENPI_AV_ALOHA_PI05_BASE_PARAMS",
+                "/workspace/ckpt_download/openpi-assets/checkpoints/pi05_base/params",
+            )
         ),
         num_train_steps=20_000,
         save_interval=1_000,

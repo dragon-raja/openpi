@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from openpi.training import config
 from openpi.training import data_loader
@@ -23,6 +24,9 @@ def _raw_sample() -> dict:
 
 def test_motor_config_preserves_prompt_and_roundtrips_task_actions(tmp_path) -> None:
     train_config = config.get_config("pi05_av_aloha_sewneedle_motor_v0")
+    assert train_config.weight_loader.params_path == (
+        "/workspace/ckpt_download/openpi-assets/checkpoints/pi05_base/params"
+    )
     data_config = train_config.data.create(tmp_path, train_config.model)
     raw = _raw_sample()
 
@@ -59,3 +63,12 @@ def test_av_aloha_uses_dedicated_local_root_and_video_backend(
 
     assert data_loader._lerobot_root_for_repo(repo_id) == "/tmp/av-aloha-v20"
     assert data_loader._lerobot_video_backend_for_repo(repo_id) == "pyav"
+
+
+def test_av_aloha_refuses_implicit_hub_download(monkeypatch) -> None:
+    monkeypatch.delenv("OPENPI_AV_ALOHA_LEROBOT_ROOT", raising=False)
+
+    with pytest.raises(
+        RuntimeError, match="refusing an implicit Hugging Face download"
+    ):
+        data_loader._lerobot_root_for_repo("iantc104/gv_sim_sew_needle_3arms")

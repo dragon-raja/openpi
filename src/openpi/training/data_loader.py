@@ -42,7 +42,13 @@ class IterableDataset(Protocol[T_co]):
 
 def _lerobot_root_for_repo(repo_id: str) -> str | None:
     if repo_id.startswith("iantc104/gv_sim_"):
-        return os.environ.get("OPENPI_AV_ALOHA_LEROBOT_ROOT")
+        root = os.environ.get("OPENPI_AV_ALOHA_LEROBOT_ROOT")
+        if not root:
+            raise RuntimeError(
+                "OPENPI_AV_ALOHA_LEROBOT_ROOT must point to the local converted "
+                "AV-ALOHA dataset; refusing an implicit Hugging Face download"
+            )
+        return root
     if repo_id.startswith("robocasa/"):
         return os.environ.get("OPENPI_ROBOCASA_LEROBOT_ROOT") or os.environ.get("ROBOCASA_LEROBOT_ROOT")
 
