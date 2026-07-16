@@ -41,6 +41,9 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            # Policy inference is synchronous and initial JAX compilation can
+            # block this event loop longer than the websocket ping timeout.
+            ping_interval=None,
             process_request=_health_check,
         ) as server:
             await server.serve_forever()
