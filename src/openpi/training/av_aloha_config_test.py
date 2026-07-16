@@ -27,6 +27,9 @@ def test_motor_config_preserves_prompt_and_roundtrips_task_actions(tmp_path) -> 
     assert train_config.weight_loader.params_path == (
         "/workspace/ckpt_download/openpi-assets/checkpoints/pi05_base/params"
     )
+    assert train_config.batch_size == 32
+    assert train_config.num_workers == 16
+    assert train_config.fsdp_devices == 4
     data_config = train_config.data.create(tmp_path, train_config.model)
     raw = _raw_sample()
 

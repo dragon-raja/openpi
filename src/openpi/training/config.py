@@ -920,7 +920,7 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
         ),
         batch_size=32,
-        num_workers=4,
+        num_workers=16,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=500,
             peak_lr=2.5e-5,
