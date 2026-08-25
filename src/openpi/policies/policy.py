@@ -122,8 +122,8 @@ class PolicyRecorder(_base_policy.BasePolicy):
         self._record_step = 0
 
     @override
-    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
-        results = self._policy.infer(obs)
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+        results = self._policy.infer(obs) if noise is None else self._policy.infer(obs, noise=noise)
 
         data = {"inputs": obs, "outputs": results}
         data = flax.traverse_util.flatten_dict(data, sep="/")

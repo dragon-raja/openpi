@@ -11,6 +11,18 @@ import websockets.frames
 
 logger = logging.getLogger(__name__)
 
+POLICY_NOISE_KEY = "_openpi_noise"
+
+
+def infer_policy_request(policy: _base_policy.BasePolicy, request: dict) -> dict:
+    policy_noise = request.pop(POLICY_NOISE_KEY, None)
+    if policy_noise is None:
+        return policy.infer(request)
+    # Supplying diffusion noise lets evaluation clients make paired
+    # interventions with identical policy randomness. The reserved key is
+    # removed before observation transforms see the request.
+    return policy.infer(request, noise=policy_noise)
+
 
 class WebsocketPolicyServer:
     """Serves a policy using the websocket protocol. See websocket_client_policy.py for a client implementation.
@@ -61,7 +73,7 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                action = self._policy.infer(obs)
+                action = infer_policy_request(self._policy, obs)
                 infer_time = time.monotonic() - infer_time
 
                 action["server_timing"] = {
