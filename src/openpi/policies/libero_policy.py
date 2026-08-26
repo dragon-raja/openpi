@@ -38,6 +38,7 @@ class LiberoInputs(transforms.DataTransformFn):
     # Determines which model will be used.
     # Do not change this for your own dataset.
     model_type: _model.ModelType
+    physical_prompt_frames: int = 0
 
     def __call__(self, data: dict) -> dict:
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
@@ -52,22 +53,72 @@ class LiberoInputs(transforms.DataTransformFn):
         base_image = _parse_image(data["observation/image"])
         wrist_image = _parse_image(data["observation/wrist_image"])
 
-        # Create inputs dict. Do not change the keys in the dict below.
-        inputs = {
-            "state": data["observation/state"],
-            "image": {
+        images = {}
+        image_masks = {}
+        if self.physical_prompt_frames:
+            raw_prompt_images = data.get("physical_prompt/images")
+            raw_prompt_actions = data.get("physical_prompt/actions")
+            raw_prompt_mask = data.get("physical_prompt/mask")
+
+            if raw_prompt_images is None:
+                prompt_images = np.zeros((self.physical_prompt_frames, *base_image.shape), dtype=base_image.dtype)
+                prompt_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
+            else:
+                if len(raw_prompt_images) != self.physical_prompt_frames:
+                    raise ValueError(
+                        f"Expected {self.physical_prompt_frames} physical-prompt images, "
+                        f"got {len(raw_prompt_images)}"
+                    )
+                prompt_images = np.stack([_parse_image(image) for image in raw_prompt_images])
+                prompt_mask = (
+                    np.ones(self.physical_prompt_frames, dtype=bool)
+                    if raw_prompt_mask is None
+                    else np.asarray(raw_prompt_mask, dtype=bool)
+                )
+
+            for frame, image in enumerate(prompt_images):
+                key = f"physical_prompt_{frame:03d}_rgb"
+                images[key] = image
+                image_masks[key] = prompt_mask[frame]
+
+            if raw_prompt_actions is None:
+                prompt_actions = np.zeros((self.physical_prompt_frames, 7), dtype=np.float32)
+                prompt_action_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
+            else:
+                prompt_actions = np.asarray(raw_prompt_actions, dtype=np.float32)
+                if prompt_actions.shape[0] != self.physical_prompt_frames:
+                    raise ValueError(
+                        f"Expected {self.physical_prompt_frames} physical-prompt actions, "
+                        f"got {prompt_actions.shape[0]}"
+                    )
+                prompt_action_mask = prompt_mask.copy()
+
+        # Create inputs dict. Prompt frames deliberately precede the live
+        # cameras in insertion order; the model also checks their key prefix.
+        images.update(
+            {
                 "base_0_rgb": base_image,
                 "left_wrist_0_rgb": wrist_image,
                 # Pad any non-existent images with zero-arrays of the appropriate shape.
                 "right_wrist_0_rgb": np.zeros_like(base_image),
-            },
-            "image_mask": {
+            }
+        )
+        image_masks.update(
+            {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
                 # We only mask padding images for pi0 model, not pi0-FAST. Do not change this for your own dataset.
                 "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
-            },
+            }
+        )
+        inputs = {
+            "state": data["observation/state"],
+            "image": images,
+            "image_mask": image_masks,
         }
+        if self.physical_prompt_frames:
+            inputs["physical_prompt_actions"] = prompt_actions
+            inputs["physical_prompt_action_mask"] = prompt_action_mask
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.

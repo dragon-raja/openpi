@@ -67,6 +67,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.physical_prompt_frames = config.physical_prompt_frames
+        self.physical_prompt_pool_grid = config.physical_prompt_pool_grid
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -90,6 +92,21 @@ class Pi0(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
+        if config.physical_prompt_frames:
+            # Prompt actions are prefix context, so they must use the PaliGemma
+            # width rather than the (smaller) action-expert width.
+            self.physical_prompt_action_in_proj = nnx.Linear(config.action_dim, paligemma_config.width, rngs=rngs)
+            self.physical_prompt_position_embedding = nnx.Param(
+                jax.random.normal(
+                    rngs.params(),
+                    (config.physical_prompt_frames, paligemma_config.width),
+                    dtype=jnp.float32,
+                )
+                * 0.02
+            )
+            self.physical_prompt_boundary_embedding = nnx.Param(
+                jax.random.normal(rngs.params(), (2, paligemma_config.width), dtype=jnp.float32) * 0.02
+            )
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -109,8 +126,83 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        # embed images
+
+        prompt_names = sorted(name for name in obs.images if name.startswith("physical_prompt_"))
+        if self.physical_prompt_frames:
+            if len(prompt_names) != self.physical_prompt_frames:
+                raise ValueError(
+                    f"Expected {self.physical_prompt_frames} physical-prompt frames, got {len(prompt_names)}"
+                )
+            if obs.physical_prompt_actions is None or obs.physical_prompt_action_mask is None:
+                raise ValueError("Physical-prompt actions and mask are required when physical prompting is enabled")
+
+            prompt_image_mask = jnp.stack([obs.image_masks[name] for name in prompt_names], axis=1)
+            prompt_valid = jnp.any(prompt_image_mask, axis=1)
+            boundary_embedding = self.physical_prompt_boundary_embedding.value
+
+            # Explicit boundary tokens and learned frame positions distinguish
+            # a demonstration from the live observation while keeping the
+            # released PaliGemma backbone intact.
+            tokens.append(
+                jnp.broadcast_to(
+                    boundary_embedding[None, :1],
+                    (prompt_valid.shape[0], 1, boundary_embedding.shape[-1]),
+                )
+            )
+            input_mask.append(prompt_valid[:, None])
+            ar_mask += [False]
+
+            for frame, name in enumerate(prompt_names):
+                image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+                side = int(image_tokens.shape[1] ** 0.5)
+                if side * side != image_tokens.shape[1] or side % self.physical_prompt_pool_grid:
+                    raise ValueError(
+                        "Physical-prompt pooling requires a square vision token map divisible by "
+                        f"{self.physical_prompt_pool_grid}; got {image_tokens.shape[1]} tokens"
+                    )
+                pool = side // self.physical_prompt_pool_grid
+                image_tokens = einops.reduce(
+                    image_tokens,
+                    "b (gh ph gw pw) d -> b (gh gw) d",
+                    "mean",
+                    gh=self.physical_prompt_pool_grid,
+                    gw=self.physical_prompt_pool_grid,
+                    ph=pool,
+                    pw=pool,
+                )
+                position = self.physical_prompt_position_embedding.value[frame]
+                image_tokens = image_tokens + position[None, None, :]
+                tokens.append(image_tokens)
+                input_mask.append(
+                    einops.repeat(
+                        obs.image_masks[name],
+                        "b -> b s",
+                        s=image_tokens.shape[1],
+                    )
+                )
+                ar_mask += [False] * image_tokens.shape[1]
+
+                action_token = self.physical_prompt_action_in_proj(obs.physical_prompt_actions[:, frame])
+                action_token = action_token[:, None, :] + position[None, None, :]
+                tokens.append(action_token)
+                input_mask.append(
+                    jnp.logical_and(obs.physical_prompt_action_mask[:, frame], obs.image_masks[name])[:, None]
+                )
+                ar_mask += [False]
+
+            tokens.append(
+                jnp.broadcast_to(
+                    boundary_embedding[None, 1:],
+                    (prompt_valid.shape[0], 1, boundary_embedding.shape[-1]),
+                )
+            )
+            input_mask.append(prompt_valid[:, None])
+            ar_mask += [False]
+
+        # Embed the live camera observations after the demonstration.
         for name in obs.images:
+            if name.startswith("physical_prompt_"):
+                continue
             image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
             tokens.append(image_tokens)

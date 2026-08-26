@@ -99,6 +99,13 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional actions aligned with sparse physical-prompt video frames.  The
+    # corresponding prompt images live in ``images`` under keys named
+    # ``physical_prompt_{frame:03d}_rgb``.  Keeping the actions separate lets
+    # us ablate or shuffle them without changing the visual prompt.
+    physical_prompt_actions: at.Float[ArrayT, "*b p a"] | None = None
+    physical_prompt_action_mask: at.Bool[ArrayT, "*b p"] | None = None
+
     # pi0-fast model specific fields.
 
     # Token auto-regressive mask (for FAST autoregressive model).
@@ -112,6 +119,8 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        if ("physical_prompt_actions" in data) != ("physical_prompt_action_mask" in data):
+            raise ValueError("physical_prompt_actions and physical_prompt_action_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -124,6 +133,8 @@ class Observation(Generic[ArrayT]):
             state=data["state"],
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
+            physical_prompt_actions=data.get("physical_prompt_actions"),
+            physical_prompt_action_mask=data.get("physical_prompt_action_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -156,16 +167,22 @@ def preprocess_observation(
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
+    prompt_image_keys = sorted(key for key in observation.images if key.startswith("physical_prompt_"))
+    resolved_image_keys = (*prompt_image_keys, *image_keys)
+
     batch_shape = observation.state.shape[:-1]
 
     out_images = {}
-    for key in image_keys:
+    for key in resolved_image_keys:
         image = observation.images[key]
         if image.shape[1:3] != image_resolution:
             logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
-        if train:
+        # Use the pretrained image preprocessing without independent random
+        # crops for prompt frames.  Frame-wise random geometry would corrupt
+        # the temporal/action correspondence that the physical prompt encodes.
+        if train and not key.startswith("physical_prompt_"):
             # Convert from [-1, 1] to [0, 1] for augmax.
             image = image / 2.0 + 0.5
 
@@ -203,6 +220,8 @@ def preprocess_observation(
         state=observation.state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
+        physical_prompt_actions=observation.physical_prompt_actions,
+        physical_prompt_action_mask=observation.physical_prompt_action_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )

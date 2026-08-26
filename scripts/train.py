@@ -189,6 +189,9 @@ def train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
+    if getattr(config.model, "physical_prompt_frames", 0):
+        info["physical_prompt_grad_norm"] = optax.global_norm(grads.filter(nnx_utils.PathRegex(".*physical_prompt.*")))
+        info["lora_grad_norm"] = optax.global_norm(grads.filter(nnx_utils.PathRegex(".*lora.*")))
     return new_state, info
 
 

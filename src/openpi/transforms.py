@@ -334,6 +334,10 @@ class PadStatesAndActions(DataTransformFn):
         data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
         if "actions" in data:
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
+        if "physical_prompt_actions" in data:
+            data["physical_prompt_actions"] = pad_to_dim(
+                data["physical_prompt_actions"], self.model_action_dim, axis=-1
+            )
         return data
 
 

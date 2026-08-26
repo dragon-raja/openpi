@@ -1,16 +1,22 @@
+import bisect
 from collections.abc import Iterator, Sequence
+import functools
+import io
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
+from datasets import DownloadConfig
 import jax
 import jax.numpy as jnp
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
+from PIL import Image
+import pyarrow.parquet as pq
 import torch
-from datasets import DownloadConfig
 
 import openpi.models.model as _model
 import openpi.training.config as _config
@@ -83,7 +89,7 @@ def _patch_lerobot_parquet_loader() -> None:
             kwargs["download_config"] = DownloadConfig(extract_compressed_file=False)
         return original_load_dataset(*args, **kwargs)
 
-    load_dataset_no_extract._openpi_no_extract_patch = True
+    load_dataset_no_extract._openpi_no_extract_patch = True  # noqa: SLF001
     lerobot_dataset.load_dataset = load_dataset_no_extract
 
 
@@ -108,6 +114,242 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class DirectParquetLeRobotDataset(Dataset):
+    """Read a v2 LeRobot dataset without materializing a Hugging Face Arrow cache.
+
+    The public LIBERO mirror stores one parquet file per episode with embedded
+    PNG bytes.  Reading row groups on demand avoids a second multi-gigabyte copy
+    under ``/root`` and avoids an unbounded metadata scan over NFS.
+    """
+
+    def __init__(self, metadata, root: str | pathlib.Path, *, action_horizon: int):
+        self.meta = metadata
+        self.root = pathlib.Path(root)
+        self.action_horizon = action_horizon
+
+        episode_indices = sorted(metadata.episodes)
+        if episode_indices != list(range(len(episode_indices))):
+            raise ValueError("Direct parquet loading requires contiguous episode indices")
+        lengths = [int(metadata.episodes[index]["length"]) for index in episode_indices]
+        ends = np.cumsum(lengths, dtype=np.int64)
+        starts = np.concatenate([np.zeros(1, dtype=np.int64), ends[:-1]])
+        self._episode_starts = starts
+        self._episode_ends = ends
+        self.episode_data_index = {
+            "from": torch.from_numpy(starts.copy()),
+            "to": torch.from_numpy(ends.copy()),
+        }
+
+    def __len__(self) -> int:
+        return int(self._episode_ends[-1])
+
+    def _episode_path(self, episode_index: int) -> pathlib.Path:
+        return self.root / self.meta.get_data_file_path(episode_index)
+
+    @functools.lru_cache(maxsize=128)  # noqa: B019 - cache lifetime intentionally matches the dataset
+    def _parquet_file(self, episode_index: int) -> pq.ParquetFile:
+        return pq.ParquetFile(self._episode_path(episode_index))
+
+    @functools.lru_cache(maxsize=128)  # noqa: B019 - cache lifetime intentionally matches the dataset
+    def _row_group_offsets(self, episode_index: int) -> tuple[int, ...]:
+        parquet_file = self._parquet_file(episode_index)
+        lengths = [parquet_file.metadata.row_group(i).num_rows for i in range(parquet_file.num_row_groups)]
+        return tuple(np.cumsum(lengths, dtype=np.int64).tolist())
+
+    @functools.lru_cache(maxsize=128)  # noqa: B019 - cache lifetime intentionally matches the dataset
+    def _read_row_group(self, episode_index: int, row_group: int) -> dict[str, list]:
+        table = self._parquet_file(episode_index).read_row_group(
+            row_group,
+            columns=[
+                "image",
+                "wrist_image",
+                "state",
+                "actions",
+                "timestamp",
+                "frame_index",
+                "episode_index",
+                "index",
+                "task_index",
+            ],
+        )
+        return table.to_pydict()
+
+    def _row(self, episode_index: int, local_index: int) -> dict:
+        offsets = self._row_group_offsets(episode_index)
+        row_group = bisect.bisect_right(offsets, local_index)
+        group_start = 0 if row_group == 0 else offsets[row_group - 1]
+        data = self._read_row_group(episode_index, row_group)
+        row = local_index - group_start
+        return {key: value[row] for key, value in data.items()}
+
+    @staticmethod
+    def _decode_image(value: dict) -> torch.Tensor:
+        if value.get("bytes") is not None:
+            with Image.open(io.BytesIO(value["bytes"])) as image:
+                array = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+        elif value.get("path") is not None:
+            with Image.open(value["path"]) as image:
+                array = np.asarray(image.convert("RGB"), dtype=np.uint8).copy()
+        else:
+            raise ValueError("Image parquet field contains neither bytes nor path")
+        return torch.from_numpy(array).permute(2, 0, 1).to(torch.float32) / 255.0
+
+    def _locate(self, index: int) -> tuple[int, int]:
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        episode_index = bisect.bisect_right(self._episode_ends, index)
+        return episode_index, index - int(self._episode_starts[episode_index])
+
+    def get_prompt_frame(self, index: int) -> dict:
+        episode_index, local_index = self._locate(index)
+        row = self._row(episode_index, local_index)
+        return {
+            "image": self._decode_image(row["image"]),
+            "actions": torch.tensor(row["actions"], dtype=torch.float32),
+        }
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        global_index = index.__index__()
+        episode_index, local_index = self._locate(global_index)
+        row = self._row(episode_index, local_index)
+        episode_length = int(self.meta.episodes[episode_index]["length"])
+        action_rows = [
+            self._row(episode_index, min(local_index + offset, episode_length - 1))["actions"]
+            for offset in range(self.action_horizon)
+        ]
+        actions_is_pad = [local_index + offset >= episode_length for offset in range(self.action_horizon)]
+
+        return {
+            "image": self._decode_image(row["image"]),
+            "wrist_image": self._decode_image(row["wrist_image"]),
+            "state": torch.tensor(row["state"], dtype=torch.float32),
+            "actions": torch.tensor(action_rows, dtype=torch.float32),
+            "actions_is_pad": torch.tensor(actions_is_pad, dtype=torch.bool),
+            "timestamp": torch.tensor(row["timestamp"], dtype=torch.float32),
+            "frame_index": torch.tensor(row["frame_index"], dtype=torch.int64),
+            "episode_index": torch.tensor(row["episode_index"], dtype=torch.int64),
+            "index": torch.tensor(row["index"], dtype=torch.int64),
+            "task_index": torch.tensor(row["task_index"], dtype=torch.int64),
+            "task": self.meta.tasks[int(row["task_index"])],
+        }
+
+
+class PhysicalPromptDataset(Dataset):
+    """Pairs each query frame with a sparse demo from another same-task episode.
+
+    Sampling is deterministic in ``(seed, query episode, query index)`` so an
+    experiment can be reproduced independently of DataLoader worker order.
+    """
+
+    def __init__(self, dataset, *, num_frames: int, seed: int = 0):
+        if num_frames <= 0:
+            raise ValueError("num_frames must be positive")
+        self._dataset = dataset
+        self._num_frames = num_frames
+        self._seed = seed
+
+        task_index_by_text = {task: task_index for task_index, task in dataset.meta.tasks.items()}
+        task_to_episodes: dict[int, list[int]] = {}
+        for episode_index, episode in dataset.meta.episodes.items():
+            episode_tasks = episode.get("tasks", [])
+            if len(episode_tasks) != 1:
+                raise ValueError(
+                    "Physical prompting currently requires one task per episode; "
+                    f"episode {episode_index} has {episode_tasks}"
+                )
+            task_index = task_index_by_text[episode_tasks[0]]
+            task_to_episodes.setdefault(task_index, []).append(episode_index)
+        self._task_to_episodes = task_to_episodes
+        self._prompt_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def __getitem__(self, index: SupportsIndex) -> dict:
+        query_index = index.__index__()
+        query = self._dataset[query_index]
+        query_episode = int(query["episode_index"])
+        task_index = int(query["task_index"])
+        candidates = self._task_to_episodes[task_index]
+
+        # Stable arithmetic hash: unlike Python's hash(), this is invariant to
+        # PYTHONHASHSEED and worker process.
+        choice = (self._seed + task_index * 1_000_003) % len(candidates)
+        demo_episode = candidates[choice]
+        if demo_episode == query_episode and len(candidates) > 1:
+            demo_episode = candidates[(choice + 1) % len(candidates)]
+
+        episode_start = int(self._dataset.episode_data_index["from"][demo_episode])
+        episode_end = int(self._dataset.episode_data_index["to"][demo_episode])
+        demo_indices = np.linspace(
+            episode_start,
+            episode_end - 1,
+            num=self._num_frames,
+            dtype=np.int64,
+        )
+        cache_key = (task_index, demo_episode)
+        if cache_key not in self._prompt_cache:
+            get_prompt_frame = getattr(self._dataset, "get_prompt_frame", self._dataset.__getitem__)
+            demo_items = [get_prompt_frame(int(demo_index)) for demo_index in demo_indices]
+            prompt_images = torch.stack([item["image"] for item in demo_items])
+            prompt_actions = []
+            for item in demo_items:
+                action = item["actions"]
+                # With delta_timestamps, LeRobot returns the full target chunk.
+                # The prompt token represents the action aligned to this frame.
+                if action.ndim > 1:
+                    action = action[0]
+                prompt_actions.append(action)
+            self._prompt_cache[cache_key] = (prompt_images, torch.stack(prompt_actions))
+        prompt_images, prompt_actions = self._prompt_cache[cache_key]
+
+        return {
+            **query,
+            "physical_prompt_images": prompt_images,
+            "physical_prompt_actions": prompt_actions,
+            "physical_prompt_mask": torch.ones(self._num_frames, dtype=torch.bool),
+            "physical_prompt_episode_index": np.int64(demo_episode),
+        }
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+
+class EpisodeBlockSampler(torch.utils.data.Sampler[int]):
+    """Shuffle episode blocks while preserving local parquet read locality."""
+
+    def __init__(self, episode_data_index: dict[str, torch.Tensor], *, block_size: int, seed: int):
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        self._starts = np.asarray(episode_data_index["from"], dtype=np.int64)
+        self._ends = np.asarray(episode_data_index["to"], dtype=np.int64)
+        self._block_size = block_size
+        self._seed = seed
+        self._epoch = 0
+
+    def __iter__(self):
+        rng = np.random.default_rng(self._seed + self._epoch)
+        self._epoch += 1
+        blocks = [
+            (start, min(start + self._block_size, end))
+            for episode_start, end in zip(self._starts, self._ends, strict=True)
+            for start in range(episode_start, end, self._block_size)
+        ]
+        rng.shuffle(blocks)
+        for start, end in blocks:
+            yield from range(start, end)
+
+    def __len__(self) -> int:
+        return int(np.sum(self._ends - self._starts))
+
+
+def _episode_data_index(dataset) -> dict[str, torch.Tensor] | None:
+    while dataset is not None:
+        if hasattr(dataset, "episode_data_index"):
+            return dataset.episode_data_index
+        dataset = getattr(dataset, "_dataset", None)
+    return None
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -194,16 +436,33 @@ def create_torch_dataset(
 
     _patch_lerobot_parquet_loader()
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=dataset_root)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        root=dataset_root,
-        video_backend=video_backend,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    if data_config.physical_prompt_frames and dataset_root:
+        dataset = DirectParquetLeRobotDataset(
+            dataset_meta,
+            dataset_root,
+            action_horizon=action_horizon,
+        )
+    else:
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            root=dataset_root,
+            video_backend=video_backend,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            },
+        )
 
-    if data_config.prompt_from_task:
+    if data_config.physical_prompt_frames:
+        dataset = PhysicalPromptDataset(
+            dataset,
+            num_frames=data_config.physical_prompt_frames,
+            seed=data_config.physical_prompt_seed,
+        )
+        dataset = TransformedDataset(
+            dataset,
+            [_transforms.InjectDefaultPrompt(data_config.physical_prompt_language)],
+        )
+    elif data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
@@ -358,12 +617,21 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    episode_data_index = _episode_data_index(dataset)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
     # For JAX, divide by process count
     sampler = None
+    if data_config.physical_prompt_frames and shuffle:
+        if episode_data_index is None:
+            raise ValueError("Physical-prompt block sampling requires episode boundaries")
+        sampler = EpisodeBlockSampler(
+            episode_data_index,
+            block_size=data_config.physical_prompt_block_size,
+            seed=seed,
+        )
     if framework == "pytorch":
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(

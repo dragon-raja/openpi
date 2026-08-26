@@ -1,10 +1,72 @@
 import dataclasses
 
 import jax
+import torch
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+class _PromptDatasetFixture:
+    def __init__(self):
+        self.meta = type(
+            "Meta",
+            (),
+            {
+                "tasks": {0: "move the object"},
+                "episodes": {
+                    0: {"tasks": ["move the object"], "length": 4},
+                    1: {"tasks": ["move the object"], "length": 4},
+                },
+            },
+        )()
+        self.episode_data_index = {
+            "from": torch.tensor([0, 4]),
+            "to": torch.tensor([4, 8]),
+        }
+
+    def __len__(self):
+        return 8
+
+    def __getitem__(self, index):
+        episode = index // 4
+        return {
+            "image": torch.full((3, 2, 2), index, dtype=torch.float32),
+            "actions": torch.full((2, 7), index, dtype=torch.float32),
+            "episode_index": torch.tensor(episode),
+            "task_index": torch.tensor(0),
+        }
+
+
+def test_physical_prompt_dataset_uses_other_episode_and_is_deterministic():
+    dataset = _data_loader.PhysicalPromptDataset(_PromptDatasetFixture(), num_frames=3, seed=7)
+
+    first = dataset[0]
+    repeated = dataset[0]
+
+    assert int(first["physical_prompt_episode_index"]) == 1
+    assert torch.equal(first["physical_prompt_images"], repeated["physical_prompt_images"])
+    assert first["physical_prompt_actions"][:, 0].tolist() == [4.0, 5.0, 7.0]
+    assert first["physical_prompt_mask"].tolist() == [True, True, True]
+
+
+def test_episode_block_sampler_preserves_blocks_and_changes_epoch_order():
+    boundaries = {
+        "from": torch.tensor([0, 5]),
+        "to": torch.tensor([5, 10]),
+    }
+    sampler = _data_loader.EpisodeBlockSampler(boundaries, block_size=3, seed=4)
+
+    epoch_a = list(sampler)
+    epoch_b = list(sampler)
+
+    assert sorted(epoch_a) == list(range(10))
+    assert sorted(epoch_b) == list(range(10))
+    assert epoch_a != epoch_b
+    # The sampler never permutes frames within a block.  Short tail blocks can
+    # appear at arbitrary positions, so verify the defining adjacency instead.
+    assert all(epoch_a.index(value + 1) == epoch_a.index(value) + 1 for value in (0, 1, 3, 5, 6, 8))
 
 
 def test_torch_data_loader():

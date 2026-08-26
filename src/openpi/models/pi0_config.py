@@ -32,6 +32,14 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Number of sparse video frames used as a sensorimotor physical prompt.
+    # Zero keeps the released pi0/pi0.5 architecture and checkpoint structure
+    # unchanged.
+    physical_prompt_frames: int = 0
+    # Spatial grid retained from each 16x16 SigLIP token map.  A 4x4 grid turns
+    # each prompt frame into 16 tokens instead of 256.
+    physical_prompt_pool_grid: int = 4
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -39,6 +47,10 @@ class Pi0Config(_model.BaseModelConfig):
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
+        if self.physical_prompt_frames < 0:
+            raise ValueError("physical_prompt_frames must be non-negative")
+        if self.physical_prompt_pool_grid <= 0 or 16 % self.physical_prompt_pool_grid != 0:
+            raise ValueError("physical_prompt_pool_grid must be a positive divisor of 16")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -68,11 +80,16 @@ class Pi0Config(_model.BaseModelConfig):
         with at.disable_typechecking():
             observation_spec = _model.Observation(
                 images={
+                    **{f"physical_prompt_{frame:03d}_rgb": image_spec for frame in range(self.physical_prompt_frames)},
                     "base_0_rgb": image_spec,
                     "left_wrist_0_rgb": image_spec,
                     "right_wrist_0_rgb": image_spec,
                 },
                 image_masks={
+                    **{
+                        f"physical_prompt_{frame:03d}_rgb": image_mask_spec
+                        for frame in range(self.physical_prompt_frames)
+                    },
                     "base_0_rgb": image_mask_spec,
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
@@ -80,6 +97,16 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                physical_prompt_actions=(
+                    jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames, self.action_dim], jnp.float32)
+                    if self.physical_prompt_frames
+                    else None
+                ),
+                physical_prompt_action_mask=(
+                    jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames], bool)
+                    if self.physical_prompt_frames
+                    else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
@@ -115,3 +142,12 @@ class Pi0Config(_model.BaseModelConfig):
         if not filters:
             return nnx.Nothing
         return nnx.All(*filters)
+
+    def get_physical_prompt_freeze_filter(self) -> nnx.filterlib.Filter:
+        """Freeze everything except LoRA and physical-prompt parameters."""
+        if not self.physical_prompt_frames:
+            raise ValueError("Physical-prompt freezing requires physical_prompt_frames > 0")
+        return nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*(lora|physical_prompt).*")),
+        )

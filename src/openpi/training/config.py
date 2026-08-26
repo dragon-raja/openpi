@@ -93,6 +93,14 @@ class DataConfig:
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
+    # Optional paired sensorimotor demonstration sampled from another episode
+    # of the same task.  The text is intentionally task-agnostic so that the
+    # policy cannot solve the experiment from language alone.
+    physical_prompt_frames: int = 0
+    physical_prompt_seed: int = 0
+    physical_prompt_language: str = "Follow the demonstrated behavior."
+    physical_prompt_block_size: int = 32
+
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
     # Action space for DROID dataset.
@@ -335,9 +343,19 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    physical_prompt_frames: int = 0
+    physical_prompt_seed: int = 0
+    physical_prompt_language: str = "Follow the demonstrated behavior."
+    physical_prompt_block_size: int = 32
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        model_prompt_frames = getattr(model_config, "physical_prompt_frames", 0)
+        if self.physical_prompt_frames != model_prompt_frames:
+            raise ValueError(
+                "Data/model physical_prompt_frames must match: "
+                f"{self.physical_prompt_frames} != {model_prompt_frames}"
+            )
         # The repack transform is *only* applied to the data coming from the dataset,
         # and *not* during inference. We can use it to make inputs from the dataset look
         # as close as possible to those coming from the inference environment (e.g. match the keys).
@@ -346,19 +364,22 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # For your own dataset, first figure out what keys your environment passes to the policy server
         # and then modify the mappings below so your dataset's keys get matched to those target keys.
         # The repack transform simply remaps key names here.
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
-                        "actions": "actions",
-                        "prompt": "prompt",
-                    }
-                )
-            ]
-        )
+        repack_structure = {
+            "observation/image": "image",
+            "observation/wrist_image": "wrist_image",
+            "observation/state": "state",
+            "actions": "actions",
+            "prompt": "prompt",
+        }
+        if self.physical_prompt_frames:
+            repack_structure.update(
+                {
+                    "physical_prompt/images": "physical_prompt_images",
+                    "physical_prompt/actions": "physical_prompt_actions",
+                    "physical_prompt/mask": "physical_prompt_mask",
+                }
+            )
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
         # Below, we define the transforms for data going into the model (``inputs``) and the transforms
@@ -367,7 +388,12 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # how to modify the transforms to match your dataset. Once you created your own transforms, you can
         # replace the transforms below with your own.
         data_transforms = _transforms.Group(
-            inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
+            inputs=[
+                libero_policy.LiberoInputs(
+                    model_type=model_config.model_type,
+                    physical_prompt_frames=self.physical_prompt_frames,
+                )
+            ],
             outputs=[libero_policy.LiberoOutputs()],
         )
 
@@ -395,11 +421,26 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         model_transforms = ModelTransformFactory()(model_config)
 
         # We return all data transforms for training and inference. No need to change anything here.
+        base_config = self.create_base_config(assets_dirs, model_config)
+        if self.physical_prompt_frames and base_config.norm_stats is not None:
+            data_transforms = data_transforms.push(
+                inputs=[
+                    _transforms.Normalize(
+                        {"physical_prompt_actions": base_config.norm_stats["actions"]},
+                        use_quantiles=base_config.use_quantile_norm,
+                    )
+                ]
+            )
+
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            physical_prompt_frames=self.physical_prompt_frames,
+            physical_prompt_seed=self.physical_prompt_seed,
+            physical_prompt_language=self.physical_prompt_language,
+            physical_prompt_block_size=self.physical_prompt_block_size,
         )
 
 
@@ -642,6 +683,14 @@ class TrainConfig:
             raise ValueError("Cannot resume and overwrite at the same time.")
 
 
+def _pi05_libero_checkpoint_path(child: str) -> str:
+    root = os.environ.get(
+        "OPENPI_PI05_LIBERO_CHECKPOINT",
+        "gs://openpi-assets/checkpoints/pi05_libero",
+    )
+    return f"{root.rstrip('/')}/{child}"
+
+
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
     #
@@ -878,6 +927,53 @@ _CONFIGS = [
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_libero_physical_prompt_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            physical_prompt_frames=8,
+            physical_prompt_pool_grid=4,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(
+                assets_dir=_pi05_libero_checkpoint_path("assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            physical_prompt_frames=8,
+            physical_prompt_seed=42,
+            physical_prompt_language="Follow the demonstrated behavior.",
+            extra_delta_transform=False,
+        ),
+        batch_size=6,
+        num_workers=0,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-5,
+            decay_steps=2_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _pi05_libero_checkpoint_path("params"),
+            missing_regex=".*(lora|physical_prompt).*",
+        ),
+        num_train_steps=2_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            physical_prompt_frames=8,
+            physical_prompt_pool_grid=4,
+        ).get_physical_prompt_freeze_filter(),
         ema_decay=None,
     ),
     TrainConfig(
