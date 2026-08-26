@@ -105,6 +105,10 @@ class Observation(Generic[ArrayT]):
     # us ablate or shuffle them without changing the visual prompt.
     physical_prompt_actions: at.Float[ArrayT, "*b p a"] | None = None
     physical_prompt_action_mask: at.Bool[ArrayT, "*b p"] | None = None
+    physical_prompt_counterfactual_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
+    physical_prompt_counterfactual_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
+    physical_prompt_counterfactual_actions: at.Float[ArrayT, "*b p a"] | None = None
+    physical_prompt_counterfactual_action_mask: at.Bool[ArrayT, "*b p"] | None = None
 
     # pi0-fast model specific fields.
 
@@ -121,12 +125,24 @@ class Observation(Generic[ArrayT]):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
         if ("physical_prompt_actions" in data) != ("physical_prompt_action_mask" in data):
             raise ValueError("physical_prompt_actions and physical_prompt_action_mask must be provided together.")
+        counterfactual_keys = (
+            "physical_prompt_counterfactual_images",
+            "physical_prompt_counterfactual_image_masks",
+            "physical_prompt_counterfactual_actions",
+            "physical_prompt_counterfactual_action_mask",
+        )
+        if any(key in data for key in counterfactual_keys) and not all(key in data for key in counterfactual_keys):
+            raise ValueError("All physical-prompt counterfactual fields must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
-        for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        image_dicts = [data["image"]]
+        if "physical_prompt_counterfactual_images" in data:
+            image_dicts.append(data["physical_prompt_counterfactual_images"])
+        for image_dict in image_dicts:
+            for key in image_dict:
+                if image_dict[key].dtype == np.uint8:
+                    image_dict[key] = image_dict[key].astype(np.float32) / 255.0 * 2.0 - 1.0
+                elif hasattr(image_dict[key], "dtype") and image_dict[key].dtype == torch.uint8:
+                    image_dict[key] = image_dict[key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -135,6 +151,10 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             physical_prompt_actions=data.get("physical_prompt_actions"),
             physical_prompt_action_mask=data.get("physical_prompt_action_mask"),
+            physical_prompt_counterfactual_images=data.get("physical_prompt_counterfactual_images"),
+            physical_prompt_counterfactual_image_masks=data.get("physical_prompt_counterfactual_image_masks"),
+            physical_prompt_counterfactual_actions=data.get("physical_prompt_counterfactual_actions"),
+            physical_prompt_counterfactual_action_mask=data.get("physical_prompt_counterfactual_action_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -222,6 +242,10 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         physical_prompt_actions=observation.physical_prompt_actions,
         physical_prompt_action_mask=observation.physical_prompt_action_mask,
+        physical_prompt_counterfactual_images=observation.physical_prompt_counterfactual_images,
+        physical_prompt_counterfactual_image_masks=observation.physical_prompt_counterfactual_image_masks,
+        physical_prompt_counterfactual_actions=observation.physical_prompt_counterfactual_actions,
+        physical_prompt_counterfactual_action_mask=observation.physical_prompt_counterfactual_action_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )

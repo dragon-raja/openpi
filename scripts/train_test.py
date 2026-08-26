@@ -2,13 +2,56 @@ import dataclasses
 import os
 import pathlib
 
+import jax.numpy as jnp
 import pytest
 
 os.environ["JAX_PLATFORMS"] = "cpu"
 
+from openpi.models import model as _model
 from openpi.training import config as _config
 
 from . import train
+
+
+def test_physical_prompt_interventions_only_change_the_prompt():
+    observation = _model.Observation(
+        images={
+            "physical_prompt_000_rgb": jnp.arange(2, dtype=jnp.float32)[:, None, None, None],
+            "physical_prompt_post_000_rgb": jnp.arange(2, 4, dtype=jnp.float32)[:, None, None, None],
+            "base_0_rgb": jnp.arange(4, 6, dtype=jnp.float32)[:, None, None, None],
+        },
+        image_masks={
+            "physical_prompt_000_rgb": jnp.ones(2, dtype=bool),
+            "physical_prompt_post_000_rgb": jnp.ones(2, dtype=bool),
+            "base_0_rgb": jnp.ones(2, dtype=bool),
+        },
+        state=jnp.zeros((2, 1)),
+        physical_prompt_actions=jnp.arange(12, dtype=jnp.float32).reshape(2, 3, 2),
+        physical_prompt_action_mask=jnp.ones((2, 3), dtype=bool),
+        physical_prompt_counterfactual_images={
+            "physical_prompt_000_rgb": jnp.arange(6, 8, dtype=jnp.float32)[:, None, None, None],
+            "physical_prompt_post_000_rgb": jnp.arange(8, 10, dtype=jnp.float32)[:, None, None, None],
+        },
+        physical_prompt_counterfactual_image_masks={
+            "physical_prompt_000_rgb": jnp.ones(2, dtype=bool),
+            "physical_prompt_post_000_rgb": jnp.ones(2, dtype=bool),
+        },
+        physical_prompt_counterfactual_actions=jnp.arange(12, 24, dtype=jnp.float32).reshape(2, 3, 2),
+        physical_prompt_counterfactual_action_mask=jnp.ones((2, 3), dtype=bool),
+    )
+
+    counterfactual = train._intervene_physical_prompt(observation, use_counterfactual=True)  # noqa: SLF001
+    reversed_actions = train._intervene_physical_prompt(observation, reverse_actions=True)  # noqa: SLF001
+
+    assert jnp.array_equal(counterfactual.images["base_0_rgb"], observation.images["base_0_rgb"])
+    assert jnp.array_equal(
+        counterfactual.images["physical_prompt_000_rgb"],
+        observation.physical_prompt_counterfactual_images["physical_prompt_000_rgb"],
+    )
+    assert jnp.array_equal(
+        reversed_actions.physical_prompt_actions,
+        observation.physical_prompt_actions[:, ::-1],
+    )
 
 
 @pytest.mark.parametrize("config_name", ["debug"])

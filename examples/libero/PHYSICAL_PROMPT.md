@@ -57,3 +57,16 @@ The public 40-task LIBERO checkpoint and dataset can validate the mechanism and 
 primitives are already in the checkpoint's training distribution. They cannot establish that the policy learned a new
 primitive in context. That claim requires held-out rules or primitives, planned for LIBERO-Plus after the baseline
 passes the same-scene causal gate.
+
+## Effect-binding follow-up
+
+The config `pi05_libero_effect_binding_lora` addresses the prompt-ignoring failure of ordinary behavior cloning. Each
+prompt unit contains `(pre-image, action, post-image)`. A compact adapter gates the visual effect difference with the
+aligned action before inserting one fused effect token. Training uses shared diffusion noise for the correct prompt,
+an explicit wrong-task prompt, and the correct images with reversed actions. Hinge ranking requires both intervened
+prompts to explain the target action worse than the correct prompt.
+
+The three same-physics counterfactual task pairs qualified by the evaluator use explicit A/B prompt mappings. Other
+tasks receive deterministic different-task negatives. This is still a mechanism experiment: evaluate with
+`counterfactual_pair_eval.py --physical-prompt-effects` and require both prompt switching and a positive aligned-minus-
+reversed action gap before scaling training or moving to LIBERO-Plus.

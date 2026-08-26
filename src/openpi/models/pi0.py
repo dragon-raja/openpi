@@ -69,6 +69,7 @@ class Pi0(_model.BaseModel):
         self.pi05 = config.pi05
         self.physical_prompt_frames = config.physical_prompt_frames
         self.physical_prompt_pool_grid = config.physical_prompt_pool_grid
+        self.physical_prompt_effects = config.physical_prompt_effects
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -107,6 +108,11 @@ class Pi0(_model.BaseModel):
             self.physical_prompt_boundary_embedding = nnx.Param(
                 jax.random.normal(rngs.params(), (2, paligemma_config.width), dtype=jnp.float32) * 0.02
             )
+            if config.physical_prompt_effects:
+                effect_width = paligemma_config.width // 8
+                self.physical_prompt_effect_down = nnx.Linear(paligemma_config.width, effect_width, rngs=rngs)
+                self.physical_prompt_effect_gate = nnx.Linear(paligemma_config.width, effect_width, rngs=rngs)
+                self.physical_prompt_effect_up = nnx.Linear(effect_width, paligemma_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -127,7 +133,12 @@ class Pi0(_model.BaseModel):
         ar_mask = []
         tokens = []
 
-        prompt_names = sorted(name for name in obs.images if name.startswith("physical_prompt_"))
+        prompt_names = sorted(
+            name
+            for name in obs.images
+            if name.startswith("physical_prompt_") and not name.startswith("physical_prompt_post_")
+        )
+        prompt_post_names = sorted(name for name in obs.images if name.startswith("physical_prompt_post_"))
         if self.physical_prompt_frames:
             if len(prompt_names) != self.physical_prompt_frames:
                 raise ValueError(
@@ -135,6 +146,10 @@ class Pi0(_model.BaseModel):
                 )
             if obs.physical_prompt_actions is None or obs.physical_prompt_action_mask is None:
                 raise ValueError("Physical-prompt actions and mask are required when physical prompting is enabled")
+            if self.physical_prompt_effects and len(prompt_post_names) != self.physical_prompt_frames:
+                raise ValueError(
+                    f"Expected {self.physical_prompt_frames} physical-prompt post frames, got {len(prompt_post_names)}"
+                )
 
             prompt_image_mask = jnp.stack([obs.image_masks[name] for name in prompt_names], axis=1)
             prompt_valid = jnp.any(prompt_image_mask, axis=1)
@@ -152,7 +167,7 @@ class Pi0(_model.BaseModel):
             input_mask.append(prompt_valid[:, None])
             ar_mask += [False]
 
-            for frame, name in enumerate(prompt_names):
+            def pool_prompt_image(name: str):
                 image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
                 side = int(image_tokens.shape[1] ** 0.5)
                 if side * side != image_tokens.shape[1] or side % self.physical_prompt_pool_grid:
@@ -161,7 +176,7 @@ class Pi0(_model.BaseModel):
                         f"{self.physical_prompt_pool_grid}; got {image_tokens.shape[1]} tokens"
                     )
                 pool = side // self.physical_prompt_pool_grid
-                image_tokens = einops.reduce(
+                return einops.reduce(
                     image_tokens,
                     "b (gh ph gw pw) d -> b (gh gw) d",
                     "mean",
@@ -170,8 +185,11 @@ class Pi0(_model.BaseModel):
                     ph=pool,
                     pw=pool,
                 )
+
+            for frame, name in enumerate(prompt_names):
+                pre_tokens = pool_prompt_image(name)
                 position = self.physical_prompt_position_embedding.value[frame]
-                image_tokens = image_tokens + position[None, None, :]
+                image_tokens = pre_tokens + position[None, None, :]
                 tokens.append(image_tokens)
                 input_mask.append(
                     einops.repeat(
@@ -183,11 +201,22 @@ class Pi0(_model.BaseModel):
                 ar_mask += [False] * image_tokens.shape[1]
 
                 action_token = self.physical_prompt_action_in_proj(obs.physical_prompt_actions[:, frame])
+                effect_mask = jnp.logical_and(obs.physical_prompt_action_mask[:, frame], obs.image_masks[name])
+                if self.physical_prompt_effects:
+                    post_name = prompt_post_names[frame]
+                    post_tokens = pool_prompt_image(post_name)
+                    # The compact transition adapter makes the demonstrated
+                    # effect explicit while retaining the spatial pre-action
+                    # tokens.  Action-dependent gating prevents the post-state
+                    # difference from becoming an action-agnostic goal image.
+                    effect_delta = jnp.mean(post_tokens - pre_tokens, axis=1)
+                    effect_latent = jax.nn.gelu(self.physical_prompt_effect_down(effect_delta))
+                    action_gate = jax.nn.sigmoid(self.physical_prompt_effect_gate(action_token))
+                    action_token = action_token + self.physical_prompt_effect_up(effect_latent * action_gate)
+                    effect_mask = jnp.logical_and(effect_mask, obs.image_masks[post_name])
                 action_token = action_token[:, None, :] + position[None, None, :]
                 tokens.append(action_token)
-                input_mask.append(
-                    jnp.logical_and(obs.physical_prompt_action_mask[:, frame], obs.image_masks[name])[:, None]
-                )
+                input_mask.append(effect_mask[:, None])
                 ar_mask += [False]
 
             tokens.append(

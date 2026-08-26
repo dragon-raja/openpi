@@ -82,6 +82,45 @@ def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shap
     )
 
 
+def _intervene_physical_prompt(
+    observation: _model.Observation,
+    *,
+    use_counterfactual: bool = False,
+    reverse_actions: bool = False,
+) -> _model.Observation:
+    """Construct a counterfactual prompt without changing the live observation."""
+    if observation.physical_prompt_actions is None or observation.physical_prompt_action_mask is None:
+        raise ValueError("Physical-prompt intervention requires prompt actions and masks")
+
+    images = dict(observation.images)
+    image_masks = dict(observation.image_masks)
+    prompt_actions = observation.physical_prompt_actions
+    prompt_action_mask = observation.physical_prompt_action_mask
+    if use_counterfactual:
+        if (
+            observation.physical_prompt_counterfactual_images is None
+            or observation.physical_prompt_counterfactual_image_masks is None
+            or observation.physical_prompt_counterfactual_actions is None
+            or observation.physical_prompt_counterfactual_action_mask is None
+        ):
+            raise ValueError("Counterfactual physical-prompt fields are required by the ranking objective")
+        images.update(observation.physical_prompt_counterfactual_images)
+        image_masks.update(observation.physical_prompt_counterfactual_image_masks)
+        prompt_actions = observation.physical_prompt_counterfactual_actions
+        prompt_action_mask = observation.physical_prompt_counterfactual_action_mask
+    if reverse_actions:
+        prompt_actions = prompt_actions[:, ::-1]
+        prompt_action_mask = prompt_action_mask[:, ::-1]
+
+    return dataclasses.replace(
+        observation,
+        images=images,
+        image_masks=image_masks,
+        physical_prompt_actions=prompt_actions,
+        physical_prompt_action_mask=prompt_action_mask,
+    )
+
+
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
@@ -145,7 +184,7 @@ def train_step(
     model.train()
 
     @at.typecheck
-    def loss_fn(
+    def behavior_cloning_loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
@@ -156,7 +195,44 @@ def train_step(
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
+    bc_loss, grads = nnx.value_and_grad(behavior_cloning_loss_fn, argnums=diff_state)(
+        model, train_rng, observation, actions
+    )
+    loss = bc_loss
+    rank_info = {}
+
+    def add_ranking_gradient(intervened_observation, *, weight: float, name: str):
+        nonlocal grads, loss
+
+        def ranking_loss_fn(model, rng, observation, actions):
+            counterfactual_loss = jnp.mean(model.compute_loss(rng, observation, actions, train=True))
+            ranking_loss = jax.nn.relu(
+                config.physical_prompt_rank_margin + jax.lax.stop_gradient(bc_loss) - counterfactual_loss
+            )
+            return ranking_loss, counterfactual_loss
+
+        (ranking_loss, counterfactual_loss), ranking_grads = nnx.value_and_grad(
+            ranking_loss_fn,
+            argnums=diff_state,
+            has_aux=True,
+        )(model, train_rng, intervened_observation, actions)
+        grads = jax.tree.map(lambda base, rank: base + weight * rank, grads, ranking_grads)
+        loss = loss + weight * ranking_loss
+        rank_info[f"{name}_loss"] = counterfactual_loss
+        rank_info[f"{name}_rank"] = ranking_loss
+
+    if config.physical_prompt_counterfactual_rank_weight:
+        add_ranking_gradient(
+            _intervene_physical_prompt(observation, use_counterfactual=True),
+            weight=config.physical_prompt_counterfactual_rank_weight,
+            name="counterfactual_prompt",
+        )
+    if config.physical_prompt_action_rank_weight:
+        add_ranking_gradient(
+            _intervene_physical_prompt(observation, reverse_actions=True),
+            weight=config.physical_prompt_action_rank_weight,
+            name="reversed_action",
+        )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -186,12 +262,18 @@ def train_step(
     )
     info = {
         "loss": loss,
+        "bc_loss": bc_loss,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
+        **rank_info,
     }
     if getattr(config.model, "physical_prompt_frames", 0):
         info["physical_prompt_grad_norm"] = optax.global_norm(grads.filter(nnx_utils.PathRegex(".*physical_prompt.*")))
         info["lora_grad_norm"] = optax.global_norm(grads.filter(nnx_utils.PathRegex(".*lora.*")))
+    if getattr(config.model, "physical_prompt_effects", False):
+        info["physical_prompt_effect_grad_norm"] = optax.global_norm(
+            grads.filter(nnx_utils.PathRegex(".*physical_prompt_effect.*"))
+        )
     return new_state, info
 
 

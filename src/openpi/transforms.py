@@ -188,6 +188,11 @@ class ResizeImages(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        if "physical_prompt_counterfactual_images" in data:
+            data["physical_prompt_counterfactual_images"] = {
+                key: image_tools.resize_with_pad(value, self.height, self.width)
+                for key, value in data["physical_prompt_counterfactual_images"].items()
+            }
         return data
 
 
@@ -337,6 +342,10 @@ class PadStatesAndActions(DataTransformFn):
         if "physical_prompt_actions" in data:
             data["physical_prompt_actions"] = pad_to_dim(
                 data["physical_prompt_actions"], self.model_action_dim, axis=-1
+            )
+        if "physical_prompt_counterfactual_actions" in data:
+            data["physical_prompt_counterfactual_actions"] = pad_to_dim(
+                data["physical_prompt_counterfactual_actions"], self.model_action_dim, axis=-1
             )
         return data
 

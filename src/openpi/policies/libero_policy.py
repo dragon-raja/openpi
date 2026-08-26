@@ -39,6 +39,8 @@ class LiberoInputs(transforms.DataTransformFn):
     # Do not change this for your own dataset.
     model_type: _model.ModelType
     physical_prompt_frames: int = 0
+    physical_prompt_effects: bool = False
+    physical_prompt_counterfactuals: bool = False
 
     def __call__(self, data: dict) -> dict:
         # Possibly need to parse images to uint8 (H,W,C) since LeRobot automatically
@@ -59,6 +61,7 @@ class LiberoInputs(transforms.DataTransformFn):
             raw_prompt_images = data.get("physical_prompt/images")
             raw_prompt_actions = data.get("physical_prompt/actions")
             raw_prompt_mask = data.get("physical_prompt/mask")
+            raw_prompt_post_images = data.get("physical_prompt/post_images")
 
             if raw_prompt_images is None:
                 prompt_images = np.zeros((self.physical_prompt_frames, *base_image.shape), dtype=base_image.dtype)
@@ -81,6 +84,23 @@ class LiberoInputs(transforms.DataTransformFn):
                 images[key] = image
                 image_masks[key] = prompt_mask[frame]
 
+            if self.physical_prompt_effects:
+                if raw_prompt_post_images is None:
+                    prompt_post_images = np.zeros_like(prompt_images)
+                    prompt_post_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
+                else:
+                    if len(raw_prompt_post_images) != self.physical_prompt_frames:
+                        raise ValueError(
+                            f"Expected {self.physical_prompt_frames} physical-prompt post images, "
+                            f"got {len(raw_prompt_post_images)}"
+                        )
+                    prompt_post_images = np.stack([_parse_image(image) for image in raw_prompt_post_images])
+                    prompt_post_mask = prompt_mask
+                for frame, image in enumerate(prompt_post_images):
+                    key = f"physical_prompt_post_{frame:03d}_rgb"
+                    images[key] = image
+                    image_masks[key] = prompt_post_mask[frame]
+
             if raw_prompt_actions is None:
                 prompt_actions = np.zeros((self.physical_prompt_frames, 7), dtype=np.float32)
                 prompt_action_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
@@ -92,6 +112,71 @@ class LiberoInputs(transforms.DataTransformFn):
                         f"got {prompt_actions.shape[0]}"
                     )
                 prompt_action_mask = prompt_mask.copy()
+
+            if self.physical_prompt_counterfactuals:
+                raw_counterfactual_images = data.get("physical_prompt/counterfactual_images")
+                raw_counterfactual_post_images = data.get("physical_prompt/counterfactual_post_images")
+                raw_counterfactual_actions = data.get("physical_prompt/counterfactual_actions")
+                raw_counterfactual_mask = data.get("physical_prompt/counterfactual_mask")
+                if raw_counterfactual_images is None:
+                    counterfactual_images = np.zeros_like(prompt_images)
+                    counterfactual_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
+                else:
+                    if len(raw_counterfactual_images) != self.physical_prompt_frames:
+                        raise ValueError(
+                            f"Expected {self.physical_prompt_frames} counterfactual-prompt images, "
+                            f"got {len(raw_counterfactual_images)}"
+                        )
+                    counterfactual_images = np.stack([_parse_image(image) for image in raw_counterfactual_images])
+                    counterfactual_mask = (
+                        np.ones(self.physical_prompt_frames, dtype=bool)
+                        if raw_counterfactual_mask is None
+                        else np.asarray(raw_counterfactual_mask, dtype=bool)
+                    )
+                counterfactual_image_dict = {
+                    f"physical_prompt_{frame:03d}_rgb": image for frame, image in enumerate(counterfactual_images)
+                }
+                counterfactual_image_mask_dict = {
+                    f"physical_prompt_{frame:03d}_rgb": counterfactual_mask[frame]
+                    for frame in range(self.physical_prompt_frames)
+                }
+                if self.physical_prompt_effects:
+                    if raw_counterfactual_post_images is None:
+                        counterfactual_post_images = np.zeros_like(counterfactual_images)
+                        counterfactual_post_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
+                    else:
+                        if len(raw_counterfactual_post_images) != self.physical_prompt_frames:
+                            raise ValueError(
+                                f"Expected {self.physical_prompt_frames} counterfactual-prompt post images, "
+                                f"got {len(raw_counterfactual_post_images)}"
+                            )
+                        counterfactual_post_images = np.stack(
+                            [_parse_image(image) for image in raw_counterfactual_post_images]
+                        )
+                        counterfactual_post_mask = counterfactual_mask
+                    counterfactual_image_dict.update(
+                        {
+                            f"physical_prompt_post_{frame:03d}_rgb": image
+                            for frame, image in enumerate(counterfactual_post_images)
+                        }
+                    )
+                    counterfactual_image_mask_dict.update(
+                        {
+                            f"physical_prompt_post_{frame:03d}_rgb": counterfactual_post_mask[frame]
+                            for frame in range(self.physical_prompt_frames)
+                        }
+                    )
+                if raw_counterfactual_actions is None:
+                    counterfactual_actions = np.zeros((self.physical_prompt_frames, 7), dtype=np.float32)
+                    counterfactual_action_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
+                else:
+                    counterfactual_actions = np.asarray(raw_counterfactual_actions, dtype=np.float32)
+                    if counterfactual_actions.shape[0] != self.physical_prompt_frames:
+                        raise ValueError(
+                            f"Expected {self.physical_prompt_frames} counterfactual-prompt actions, "
+                            f"got {counterfactual_actions.shape[0]}"
+                        )
+                    counterfactual_action_mask = counterfactual_mask.copy()
 
         # Create inputs dict. Prompt frames deliberately precede the live
         # cameras in insertion order; the model also checks their key prefix.
@@ -119,6 +204,11 @@ class LiberoInputs(transforms.DataTransformFn):
         if self.physical_prompt_frames:
             inputs["physical_prompt_actions"] = prompt_actions
             inputs["physical_prompt_action_mask"] = prompt_action_mask
+            if self.physical_prompt_counterfactuals:
+                inputs["physical_prompt_counterfactual_images"] = counterfactual_image_dict
+                inputs["physical_prompt_counterfactual_image_masks"] = counterfactual_image_mask_dict
+                inputs["physical_prompt_counterfactual_actions"] = counterfactual_actions
+                inputs["physical_prompt_counterfactual_action_mask"] = counterfactual_action_mask
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.

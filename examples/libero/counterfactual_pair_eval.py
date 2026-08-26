@@ -44,9 +44,10 @@ class PhysicalPrompt:
     images: np.ndarray
     actions: np.ndarray
     mask: np.ndarray
+    post_images: np.ndarray | None = None
 
     def metadata(self, *, action_order: str) -> dict:
-        return {
+        metadata = {
             "task": self.task,
             "demo_episode_index": self.demo_episode_index,
             "num_frames": int(len(self.images)),
@@ -54,6 +55,9 @@ class PhysicalPrompt:
             "action_sha256": _sha256(self.actions),
             "action_order": action_order,
         }
+        if self.post_images is not None:
+            metadata["post_image_sha256"] = _sha256(self.post_images)
+        return metadata
 
 
 @dataclasses.dataclass(frozen=True)
@@ -315,6 +319,8 @@ def _policy_observation(
                 "physical_prompt/mask": physical_prompt.mask,
             }
         )
+        if physical_prompt.post_images is not None:
+            element["physical_prompt/post_images"] = physical_prompt.post_images
     return element, image
 
 
@@ -325,6 +331,7 @@ def _load_physical_prompts(
     num_frames: int,
     seed: int,
     action_horizon: int,
+    include_effects: bool = False,
 ) -> dict[str, PhysicalPrompt]:
     """Load one deterministic other-episode demonstration for each task."""
     from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -339,7 +346,12 @@ def _load_physical_prompts(
         raise ValueError(f"Tasks are absent from the physical-prompt dataset: {missing_tasks}")
 
     base_dataset = DirectParquetLeRobotDataset(metadata, dataset_root, action_horizon=action_horizon)
-    prompt_dataset = PhysicalPromptDataset(base_dataset, num_frames=num_frames, seed=seed)
+    prompt_dataset = PhysicalPromptDataset(
+        base_dataset,
+        num_frames=num_frames,
+        seed=seed,
+        include_effects=include_effects,
+    )
     prompt_by_task: dict[str, PhysicalPrompt] = {}
     for task in sorted(tasks):
         query_episode = next(
@@ -350,12 +362,18 @@ def _load_physical_prompts(
         prompt_images = np.asarray(item["physical_prompt_images"])
         prompt_images = np.transpose(prompt_images, (0, 2, 3, 1))
         prompt_images = np.rint(prompt_images * 255).clip(0, 255).astype(np.uint8)
+        prompt_post_images = item.get("physical_prompt_post_images")
+        if prompt_post_images is not None:
+            prompt_post_images = np.asarray(prompt_post_images)
+            prompt_post_images = np.transpose(prompt_post_images, (0, 2, 3, 1))
+            prompt_post_images = np.rint(prompt_post_images * 255).clip(0, 255).astype(np.uint8)
         prompt_by_task[task] = PhysicalPrompt(
             task=task,
             demo_episode_index=int(item["physical_prompt_episode_index"]),
             images=prompt_images,
             actions=np.asarray(item["physical_prompt_actions"], dtype=np.float32),
             mask=np.asarray(item["physical_prompt_mask"], dtype=bool),
+            post_images=prompt_post_images,
         )
     return prompt_by_task
 
@@ -483,6 +501,7 @@ def evaluate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tupl
             num_frames=args.physical_prompt_frames,
             seed=args.physical_prompt_seed,
             action_horizon=args.action_horizon,
+            include_effects=args.physical_prompt_effects,
         )
 
     for spec in pair_specs:
@@ -631,6 +650,11 @@ def main() -> None:
     )
     parser.add_argument("--physical-prompt-frames", type=int, default=8)
     parser.add_argument("--physical-prompt-seed", type=int, default=42)
+    parser.add_argument(
+        "--physical-prompt-effects",
+        action="store_true",
+        help="Send post-action images for an effect-binding physical-prompt model.",
+    )
     parser.add_argument("--output-jsonl")
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--video-out-path", default="/tmp/libero_counterfactual_videos")

@@ -100,6 +100,8 @@ class DataConfig:
     physical_prompt_seed: int = 0
     physical_prompt_language: str = "Follow the demonstrated behavior."
     physical_prompt_block_size: int = 32
+    physical_prompt_effects: bool = False
+    physical_prompt_counterfactuals: bool = False
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -347,6 +349,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     physical_prompt_seed: int = 0
     physical_prompt_language: str = "Follow the demonstrated behavior."
     physical_prompt_block_size: int = 32
+    physical_prompt_effects: bool = False
+    physical_prompt_counterfactuals: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -355,6 +359,18 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             raise ValueError(
                 "Data/model physical_prompt_frames must match: "
                 f"{self.physical_prompt_frames} != {model_prompt_frames}"
+            )
+        model_prompt_effects = getattr(model_config, "physical_prompt_effects", False)
+        if self.physical_prompt_effects != model_prompt_effects:
+            raise ValueError(
+                "Data/model physical_prompt_effects must match: "
+                f"{self.physical_prompt_effects} != {model_prompt_effects}"
+            )
+        model_prompt_counterfactuals = getattr(model_config, "physical_prompt_counterfactuals", False)
+        if self.physical_prompt_counterfactuals != model_prompt_counterfactuals:
+            raise ValueError(
+                "Data/model physical_prompt_counterfactuals must match: "
+                f"{self.physical_prompt_counterfactuals} != {model_prompt_counterfactuals}"
             )
         # The repack transform is *only* applied to the data coming from the dataset,
         # and *not* during inference. We can use it to make inputs from the dataset look
@@ -379,6 +395,20 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                     "physical_prompt/mask": "physical_prompt_mask",
                 }
             )
+            if self.physical_prompt_effects:
+                repack_structure["physical_prompt/post_images"] = "physical_prompt_post_images"
+            if self.physical_prompt_counterfactuals:
+                repack_structure.update(
+                    {
+                        "physical_prompt/counterfactual_images": "physical_prompt_counterfactual_images",
+                        "physical_prompt/counterfactual_actions": "physical_prompt_counterfactual_actions",
+                        "physical_prompt/counterfactual_mask": "physical_prompt_counterfactual_mask",
+                    }
+                )
+                if self.physical_prompt_effects:
+                    repack_structure["physical_prompt/counterfactual_post_images"] = (
+                        "physical_prompt_counterfactual_post_images"
+                    )
         repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_structure)])
 
         # The data transforms are applied to the data coming from the dataset *and* during inference.
@@ -392,6 +422,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                 libero_policy.LiberoInputs(
                     model_type=model_config.model_type,
                     physical_prompt_frames=self.physical_prompt_frames,
+                    physical_prompt_effects=self.physical_prompt_effects,
+                    physical_prompt_counterfactuals=self.physical_prompt_counterfactuals,
                 )
             ],
             outputs=[libero_policy.LiberoOutputs()],
@@ -423,10 +455,13 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         # We return all data transforms for training and inference. No need to change anything here.
         base_config = self.create_base_config(assets_dirs, model_config)
         if self.physical_prompt_frames and base_config.norm_stats is not None:
+            prompt_norms = {"physical_prompt_actions": base_config.norm_stats["actions"]}
+            if self.physical_prompt_counterfactuals:
+                prompt_norms["physical_prompt_counterfactual_actions"] = base_config.norm_stats["actions"]
             data_transforms = data_transforms.push(
                 inputs=[
                     _transforms.Normalize(
-                        {"physical_prompt_actions": base_config.norm_stats["actions"]},
+                        prompt_norms,
                         use_quantiles=base_config.use_quantile_norm,
                     )
                 ]
@@ -441,6 +476,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             physical_prompt_seed=self.physical_prompt_seed,
             physical_prompt_language=self.physical_prompt_language,
             physical_prompt_block_size=self.physical_prompt_block_size,
+            physical_prompt_effects=self.physical_prompt_effects,
+            physical_prompt_counterfactuals=self.physical_prompt_counterfactuals,
         )
 
 
@@ -652,6 +689,13 @@ class TrainConfig:
     # If true, will enable wandb logging.
     wandb_enabled: bool = True
 
+    # Optional causal physical-prompt ranking.  The correct prompt is trained
+    # with behavior cloning, while explicit wrong-task prompts and
+    # temporally reversed actions must incur a larger denoising loss.
+    physical_prompt_counterfactual_rank_weight: float = 0.0
+    physical_prompt_action_rank_weight: float = 0.0
+    physical_prompt_rank_margin: float = 0.02
+
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
 
@@ -681,6 +725,14 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if self.physical_prompt_counterfactual_rank_weight < 0 or self.physical_prompt_action_rank_weight < 0:
+            raise ValueError("Physical-prompt ranking weights must be non-negative")
+        if self.physical_prompt_rank_margin < 0:
+            raise ValueError("Physical-prompt ranking margin must be non-negative")
+        if (self.physical_prompt_counterfactual_rank_weight or self.physical_prompt_action_rank_weight) and not getattr(
+            self.model, "physical_prompt_frames", 0
+        ):
+            raise ValueError("Physical-prompt ranking requires a physical-prompt model")
 
 
 def _pi05_libero_checkpoint_path(child: str) -> str:
@@ -974,6 +1026,62 @@ _CONFIGS = [
             physical_prompt_frames=8,
             physical_prompt_pool_grid=4,
         ).get_physical_prompt_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_libero_effect_binding_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            physical_prompt_frames=8,
+            physical_prompt_pool_grid=4,
+            physical_prompt_effects=True,
+            physical_prompt_counterfactuals=True,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(
+                assets_dir=_pi05_libero_checkpoint_path("assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            physical_prompt_frames=8,
+            physical_prompt_seed=42,
+            physical_prompt_language="Follow the demonstrated behavior.",
+            physical_prompt_effects=True,
+            physical_prompt_counterfactuals=True,
+            extra_delta_transform=False,
+        ),
+        batch_size=6,
+        num_workers=0,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=5e-5,
+            decay_steps=1_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _pi05_libero_checkpoint_path("params"),
+            missing_regex=".*(lora|physical_prompt).*",
+        ),
+        num_train_steps=1_000,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            physical_prompt_frames=8,
+            physical_prompt_pool_grid=4,
+            physical_prompt_effects=True,
+            physical_prompt_counterfactuals=True,
+        ).get_physical_prompt_freeze_filter(),
+        physical_prompt_counterfactual_rank_weight=0.5,
+        physical_prompt_action_rank_weight=0.5,
+        physical_prompt_rank_margin=0.02,
         ema_decay=None,
     ),
     TrainConfig(

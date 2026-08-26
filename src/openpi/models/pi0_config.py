@@ -39,6 +39,13 @@ class Pi0Config(_model.BaseModelConfig):
     # Spatial grid retained from each 16x16 SigLIP token map.  A 4x4 grid turns
     # each prompt frame into 16 tokens instead of 256.
     physical_prompt_pool_grid: int = 4
+    # Encode action effects from explicit (pre-image, action, post-image)
+    # transition units rather than independent frame-action pairs.
+    physical_prompt_effects: bool = False
+    # Carry an explicit wrong-task demonstration during training.  These
+    # fields are ignored by inference and only materialized by the causal
+    # ranking objective.
+    physical_prompt_counterfactuals: bool = False
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -51,6 +58,10 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("physical_prompt_frames must be non-negative")
         if self.physical_prompt_pool_grid <= 0 or 16 % self.physical_prompt_pool_grid != 0:
             raise ValueError("physical_prompt_pool_grid must be a positive divisor of 16")
+        if self.physical_prompt_effects and not self.physical_prompt_frames:
+            raise ValueError("physical_prompt_effects requires physical_prompt_frames > 0")
+        if self.physical_prompt_counterfactuals and not self.physical_prompt_frames:
+            raise ValueError("physical_prompt_counterfactuals requires physical_prompt_frames > 0")
         if self.pytorch_compile_mode is not None:
             assert self.pytorch_compile_mode in [
                 "default",
@@ -81,6 +92,14 @@ class Pi0Config(_model.BaseModelConfig):
             observation_spec = _model.Observation(
                 images={
                     **{f"physical_prompt_{frame:03d}_rgb": image_spec for frame in range(self.physical_prompt_frames)},
+                    **(
+                        {
+                            f"physical_prompt_post_{frame:03d}_rgb": image_spec
+                            for frame in range(self.physical_prompt_frames)
+                        }
+                        if self.physical_prompt_effects
+                        else {}
+                    ),
                     "base_0_rgb": image_spec,
                     "left_wrist_0_rgb": image_spec,
                     "right_wrist_0_rgb": image_spec,
@@ -90,6 +109,14 @@ class Pi0Config(_model.BaseModelConfig):
                         f"physical_prompt_{frame:03d}_rgb": image_mask_spec
                         for frame in range(self.physical_prompt_frames)
                     },
+                    **(
+                        {
+                            f"physical_prompt_post_{frame:03d}_rgb": image_mask_spec
+                            for frame in range(self.physical_prompt_frames)
+                        }
+                        if self.physical_prompt_effects
+                        else {}
+                    ),
                     "base_0_rgb": image_mask_spec,
                     "left_wrist_0_rgb": image_mask_spec,
                     "right_wrist_0_rgb": image_mask_spec,
@@ -105,6 +132,52 @@ class Pi0Config(_model.BaseModelConfig):
                 physical_prompt_action_mask=(
                     jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames], bool)
                     if self.physical_prompt_frames
+                    else None
+                ),
+                physical_prompt_counterfactual_images=(
+                    {
+                        **{
+                            f"physical_prompt_{frame:03d}_rgb": image_spec
+                            for frame in range(self.physical_prompt_frames)
+                        },
+                        **(
+                            {
+                                f"physical_prompt_post_{frame:03d}_rgb": image_spec
+                                for frame in range(self.physical_prompt_frames)
+                            }
+                            if self.physical_prompt_effects
+                            else {}
+                        ),
+                    }
+                    if self.physical_prompt_counterfactuals
+                    else None
+                ),
+                physical_prompt_counterfactual_image_masks=(
+                    {
+                        **{
+                            f"physical_prompt_{frame:03d}_rgb": image_mask_spec
+                            for frame in range(self.physical_prompt_frames)
+                        },
+                        **(
+                            {
+                                f"physical_prompt_post_{frame:03d}_rgb": image_mask_spec
+                                for frame in range(self.physical_prompt_frames)
+                            }
+                            if self.physical_prompt_effects
+                            else {}
+                        ),
+                    }
+                    if self.physical_prompt_counterfactuals
+                    else None
+                ),
+                physical_prompt_counterfactual_actions=(
+                    jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames, self.action_dim], jnp.float32)
+                    if self.physical_prompt_counterfactuals
+                    else None
+                ),
+                physical_prompt_counterfactual_action_mask=(
+                    jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames], bool)
+                    if self.physical_prompt_counterfactuals
                     else None
                 ),
             )

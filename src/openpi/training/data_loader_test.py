@@ -39,6 +39,39 @@ class _PromptDatasetFixture:
         }
 
 
+class _CounterfactualPromptDatasetFixture:
+    def __init__(self):
+        self.meta = type(
+            "Meta",
+            (),
+            {
+                "tasks": {0: "task zero", 1: "task one"},
+                "episodes": {
+                    0: {"tasks": ["task zero"], "length": 4},
+                    1: {"tasks": ["task zero"], "length": 4},
+                    2: {"tasks": ["task one"], "length": 4},
+                    3: {"tasks": ["task one"], "length": 4},
+                },
+            },
+        )()
+        self.episode_data_index = {
+            "from": torch.tensor([0, 4, 8, 12]),
+            "to": torch.tensor([4, 8, 12, 16]),
+        }
+
+    def __len__(self):
+        return 16
+
+    def __getitem__(self, index):
+        episode = index // 4
+        return {
+            "image": torch.full((3, 2, 2), index, dtype=torch.float32),
+            "actions": torch.full((2, 7), index, dtype=torch.float32),
+            "episode_index": torch.tensor(episode),
+            "task_index": torch.tensor(episode // 2),
+        }
+
+
 def test_physical_prompt_dataset_uses_other_episode_and_is_deterministic():
     dataset = _data_loader.PhysicalPromptDataset(_PromptDatasetFixture(), num_frames=3, seed=7)
 
@@ -49,6 +82,32 @@ def test_physical_prompt_dataset_uses_other_episode_and_is_deterministic():
     assert torch.equal(first["physical_prompt_images"], repeated["physical_prompt_images"])
     assert first["physical_prompt_actions"][:, 0].tolist() == [4.0, 5.0, 7.0]
     assert first["physical_prompt_mask"].tolist() == [True, True, True]
+
+
+def test_physical_prompt_dataset_builds_action_effect_transitions():
+    dataset = _data_loader.PhysicalPromptDataset(_PromptDatasetFixture(), num_frames=3, seed=7, include_effects=True)
+
+    item = dataset[0]
+
+    assert item["physical_prompt_images"][:, 0, 0, 0].tolist() == [4.0, 5.0, 6.0]
+    assert item["physical_prompt_post_images"][:, 0, 0, 0].tolist() == [5.0, 6.0, 7.0]
+    assert item["physical_prompt_actions"][:, 0].tolist() == [4.0, 5.0, 6.0]
+
+
+def test_physical_prompt_dataset_supplies_an_explicit_wrong_task():
+    dataset = _data_loader.PhysicalPromptDataset(
+        _CounterfactualPromptDatasetFixture(),
+        num_frames=3,
+        seed=7,
+        include_effects=True,
+        include_counterfactuals=True,
+    )
+
+    item = dataset[0]
+
+    assert int(item["physical_prompt_counterfactual_task_index"]) == 1
+    assert item["physical_prompt_counterfactual_images"].shape == (3, 3, 2, 2)
+    assert not torch.equal(item["physical_prompt_images"], item["physical_prompt_counterfactual_images"])
 
 
 def test_episode_block_sampler_preserves_blocks_and_changes_epoch_order():

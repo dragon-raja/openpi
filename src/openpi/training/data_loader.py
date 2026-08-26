@@ -26,6 +26,20 @@ import openpi.transforms as _transforms
 T_co = TypeVar("T_co", covariant=True)
 
 
+_LIBERO_COUNTERFACTUAL_TASK_PAIRS = {
+    "put both the alphabet soup and the tomato sauce in the basket": (
+        "put both the cream cheese box and the butter in the basket"
+    ),
+    "put both the cream cheese box and the butter in the basket": (
+        "put both the alphabet soup and the tomato sauce in the basket"
+    ),
+    "put the bowl on the plate": "put the bowl on the stove",
+    "put the bowl on the stove": "put the bowl on the plate",
+    "put the wine bottle on the rack": "put the wine bottle on top of the cabinet",
+    "put the wine bottle on top of the cabinet": "put the wine bottle on the rack",
+}
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -245,12 +259,22 @@ class PhysicalPromptDataset(Dataset):
     experiment can be reproduced independently of DataLoader worker order.
     """
 
-    def __init__(self, dataset, *, num_frames: int, seed: int = 0):
+    def __init__(
+        self,
+        dataset,
+        *,
+        num_frames: int,
+        seed: int = 0,
+        include_effects: bool = False,
+        include_counterfactuals: bool = False,
+    ):
         if num_frames <= 0:
             raise ValueError("num_frames must be positive")
         self._dataset = dataset
         self._num_frames = num_frames
         self._seed = seed
+        self._include_effects = include_effects
+        self._include_counterfactuals = include_counterfactuals
 
         task_index_by_text = {task: task_index for task_index, task in dataset.meta.tasks.items()}
         task_to_episodes: dict[int, list[int]] = {}
@@ -264,7 +288,37 @@ class PhysicalPromptDataset(Dataset):
             task_index = task_index_by_text[episode_tasks[0]]
             task_to_episodes.setdefault(task_index, []).append(episode_index)
         self._task_to_episodes = task_to_episodes
-        self._prompt_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self._task_index_by_text = task_index_by_text
+        self._prompt_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+
+    def _load_prompt(self, task_index: int, demo_episode: int):
+        cache_key = (task_index, demo_episode)
+        if cache_key in self._prompt_cache:
+            return self._prompt_cache[cache_key]
+
+        episode_start = int(self._dataset.episode_data_index["from"][demo_episode])
+        episode_end = int(self._dataset.episode_data_index["to"][demo_episode])
+        demo_indices = np.linspace(
+            episode_start,
+            episode_end - 1,
+            num=self._num_frames + int(self._include_effects),
+            dtype=np.int64,
+        )
+        get_prompt_frame = getattr(self._dataset, "get_prompt_frame", self._dataset.__getitem__)
+        demo_items = [get_prompt_frame(int(demo_index)) for demo_index in demo_indices]
+        prompt_images = torch.stack([item["image"] for item in demo_items[: self._num_frames]])
+        prompt_post_images = torch.stack([item["image"] for item in demo_items[1:]]) if self._include_effects else None
+        prompt_actions = []
+        for item in demo_items[: self._num_frames]:
+            action = item["actions"]
+            # With delta_timestamps, LeRobot returns the full target chunk.
+            # The prompt token represents the action aligned to this frame.
+            if action.ndim > 1:
+                action = action[0]
+            prompt_actions.append(action)
+        result = (prompt_images, torch.stack(prompt_actions), prompt_post_images)
+        self._prompt_cache[cache_key] = result
+        return result
 
     def __getitem__(self, index: SupportsIndex) -> dict:
         query_index = index.__index__()
@@ -280,37 +334,43 @@ class PhysicalPromptDataset(Dataset):
         if demo_episode == query_episode and len(candidates) > 1:
             demo_episode = candidates[(choice + 1) % len(candidates)]
 
-        episode_start = int(self._dataset.episode_data_index["from"][demo_episode])
-        episode_end = int(self._dataset.episode_data_index["to"][demo_episode])
-        demo_indices = np.linspace(
-            episode_start,
-            episode_end - 1,
-            num=self._num_frames,
-            dtype=np.int64,
-        )
-        cache_key = (task_index, demo_episode)
-        if cache_key not in self._prompt_cache:
-            get_prompt_frame = getattr(self._dataset, "get_prompt_frame", self._dataset.__getitem__)
-            demo_items = [get_prompt_frame(int(demo_index)) for demo_index in demo_indices]
-            prompt_images = torch.stack([item["image"] for item in demo_items])
-            prompt_actions = []
-            for item in demo_items:
-                action = item["actions"]
-                # With delta_timestamps, LeRobot returns the full target chunk.
-                # The prompt token represents the action aligned to this frame.
-                if action.ndim > 1:
-                    action = action[0]
-                prompt_actions.append(action)
-            self._prompt_cache[cache_key] = (prompt_images, torch.stack(prompt_actions))
-        prompt_images, prompt_actions = self._prompt_cache[cache_key]
+        prompt_images, prompt_actions, prompt_post_images = self._load_prompt(task_index, demo_episode)
 
-        return {
+        result = {
             **query,
             "physical_prompt_images": prompt_images,
             "physical_prompt_actions": prompt_actions,
             "physical_prompt_mask": torch.ones(self._num_frames, dtype=torch.bool),
             "physical_prompt_episode_index": np.int64(demo_episode),
         }
+        if prompt_post_images is not None:
+            result["physical_prompt_post_images"] = prompt_post_images
+        if self._include_counterfactuals:
+            task_text = self._dataset.meta.tasks[task_index]
+            counterfactual_text = _LIBERO_COUNTERFACTUAL_TASK_PAIRS.get(task_text)
+            if counterfactual_text is None:
+                task_indices = sorted(self._task_to_episodes)
+                counterfactual_task = task_indices[(task_indices.index(task_index) + 1) % len(task_indices)]
+            else:
+                counterfactual_task = self._task_index_by_text[counterfactual_text]
+            counterfactual_candidates = self._task_to_episodes[counterfactual_task]
+            counterfactual_choice = (self._seed + counterfactual_task * 1_000_003) % len(counterfactual_candidates)
+            counterfactual_episode = counterfactual_candidates[counterfactual_choice]
+            counterfactual_images, counterfactual_actions, counterfactual_post_images = self._load_prompt(
+                counterfactual_task, counterfactual_episode
+            )
+            result.update(
+                {
+                    "physical_prompt_counterfactual_images": counterfactual_images,
+                    "physical_prompt_counterfactual_actions": counterfactual_actions,
+                    "physical_prompt_counterfactual_mask": torch.ones(self._num_frames, dtype=torch.bool),
+                    "physical_prompt_counterfactual_episode_index": np.int64(counterfactual_episode),
+                    "physical_prompt_counterfactual_task_index": np.int64(counterfactual_task),
+                }
+            )
+            if counterfactual_post_images is not None:
+                result["physical_prompt_counterfactual_post_images"] = counterfactual_post_images
+        return result
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -457,6 +517,8 @@ def create_torch_dataset(
             dataset,
             num_frames=data_config.physical_prompt_frames,
             seed=data_config.physical_prompt_seed,
+            include_effects=data_config.physical_prompt_effects,
+            include_counterfactuals=data_config.physical_prompt_counterfactuals,
         )
         dataset = TransformedDataset(
             dataset,
