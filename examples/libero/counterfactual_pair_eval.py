@@ -25,7 +25,7 @@ from openpi_client import websocket_client_policy
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256
 POLICY_NOISE_KEY = "_openpi_noise"
-NEUTRAL_PROMPT = "perform the demonstrated rule"
+NEUTRAL_PROMPT = "Follow the demonstrated behavior."
 STATE_ATOL = 1e-12
 
 
@@ -35,6 +35,34 @@ class PairSpec:
     suite: str
     task_a: str
     task_b: str
+
+
+@dataclasses.dataclass(frozen=True)
+class PhysicalPrompt:
+    task: str
+    demo_episode_index: int
+    images: np.ndarray
+    actions: np.ndarray
+    mask: np.ndarray
+
+    def metadata(self, *, action_order: str) -> dict:
+        return {
+            "task": self.task,
+            "demo_episode_index": self.demo_episode_index,
+            "num_frames": int(len(self.images)),
+            "image_sha256": _sha256(self.images),
+            "action_sha256": _sha256(self.actions),
+            "action_order": action_order,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class PromptCondition:
+    name: str
+    language: str
+    expected_goal: str | None
+    physical_prompt: PhysicalPrompt | None = None
+    action_order: str = "aligned"
 
 
 PAIR_SPECS = {
@@ -214,11 +242,7 @@ def _observation_differences(obs_a: dict, obs_b: dict) -> dict[str, float]:
 
 
 def _copy_observation(obs: dict) -> dict[str, np.ndarray]:
-    return {
-        key: np.array(value, copy=True)
-        for key, value in obs.items()
-        if isinstance(value, np.ndarray)
-    }
+    return {key: np.array(value, copy=True) for key, value in obs.items() if isinstance(value, np.ndarray)}
 
 
 def _reset_pair(env_a, env_b, initial_state: np.ndarray, wait_steps: int):
@@ -253,13 +277,18 @@ def _policy_noise(
     return rng.standard_normal((action_horizon, action_dim), dtype=np.float32)
 
 
-def _policy_observation(obs: dict, prompt: str, resize_size: int, noise: np.ndarray) -> tuple[dict, np.ndarray]:
+def _policy_observation(
+    obs: dict,
+    prompt: str,
+    resize_size: int,
+    noise: np.ndarray,
+    physical_prompt: PhysicalPrompt | None = None,
+    action_order: str = "aligned",
+) -> tuple[dict, np.ndarray]:
     image = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
     wrist_image = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
     image = image_tools.convert_to_uint8(image_tools.resize_with_pad(image, resize_size, resize_size))
-    wrist_image = image_tools.convert_to_uint8(
-        image_tools.resize_with_pad(wrist_image, resize_size, resize_size)
-    )
+    wrist_image = image_tools.convert_to_uint8(image_tools.resize_with_pad(wrist_image, resize_size, resize_size))
     element = {
         "observation/image": image,
         "observation/wrist_image": wrist_image,
@@ -273,7 +302,86 @@ def _policy_observation(obs: dict, prompt: str, resize_size: int, noise: np.ndar
         "prompt": prompt,
         POLICY_NOISE_KEY: noise,
     }
+    if physical_prompt is not None:
+        prompt_actions = physical_prompt.actions
+        if action_order == "reversed":
+            prompt_actions = prompt_actions[::-1].copy()
+        elif action_order != "aligned":
+            raise ValueError(f"Unknown physical-prompt action order: {action_order}")
+        element.update(
+            {
+                "physical_prompt/images": physical_prompt.images,
+                "physical_prompt/actions": prompt_actions,
+                "physical_prompt/mask": physical_prompt.mask,
+            }
+        )
     return element, image
+
+
+def _load_physical_prompts(
+    dataset_root: str,
+    tasks: set[str],
+    *,
+    num_frames: int,
+    seed: int,
+    action_horizon: int,
+) -> dict[str, PhysicalPrompt]:
+    """Load one deterministic other-episode demonstration for each task."""
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
+
+    from openpi.training.data_loader import DirectParquetLeRobotDataset
+    from openpi.training.data_loader import PhysicalPromptDataset
+
+    metadata = LeRobotDatasetMetadata("physical-intelligence/libero", root=dataset_root)
+    task_indices = {task: task_index for task_index, task in metadata.tasks.items()}
+    missing_tasks = sorted(tasks - set(task_indices))
+    if missing_tasks:
+        raise ValueError(f"Tasks are absent from the physical-prompt dataset: {missing_tasks}")
+
+    base_dataset = DirectParquetLeRobotDataset(metadata, dataset_root, action_horizon=action_horizon)
+    prompt_dataset = PhysicalPromptDataset(base_dataset, num_frames=num_frames, seed=seed)
+    prompt_by_task: dict[str, PhysicalPrompt] = {}
+    for task in sorted(tasks):
+        query_episode = next(
+            episode_index for episode_index, episode in metadata.episodes.items() if episode["tasks"] == [task]
+        )
+        query_index = int(base_dataset.episode_data_index["from"][query_episode])
+        item = prompt_dataset[query_index]
+        prompt_images = np.asarray(item["physical_prompt_images"])
+        prompt_images = np.transpose(prompt_images, (0, 2, 3, 1))
+        prompt_images = np.rint(prompt_images * 255).clip(0, 255).astype(np.uint8)
+        prompt_by_task[task] = PhysicalPrompt(
+            task=task,
+            demo_episode_index=int(item["physical_prompt_episode_index"]),
+            images=prompt_images,
+            actions=np.asarray(item["physical_prompt_actions"], dtype=np.float32),
+            mask=np.asarray(item["physical_prompt_mask"], dtype=bool),
+        )
+    return prompt_by_task
+
+
+def _prompt_conditions(
+    args,
+    task_a,
+    task_b,
+    physical_prompts: dict[str, PhysicalPrompt] | None,
+) -> tuple[PromptCondition, ...]:
+    if physical_prompts is None:
+        return (
+            PromptCondition("language_a", task_a.language, "a"),
+            PromptCondition("language_b", task_b.language, "b"),
+            PromptCondition("neutral_no_information", args.neutral_prompt, None),
+        )
+
+    prompt_a = physical_prompts[task_a.language]
+    prompt_b = physical_prompts[task_b.language]
+    return (
+        PromptCondition("physical_a_aligned", args.neutral_prompt, "a", prompt_a),
+        PromptCondition("physical_b_aligned", args.neutral_prompt, "b", prompt_b),
+        PromptCondition("physical_a_reversed_actions", args.neutral_prompt, "a", prompt_a, "reversed"),
+        PromptCondition("physical_b_reversed_actions", args.neutral_prompt, "b", prompt_b, "reversed"),
+        PromptCondition("physical_no_prompt", args.neutral_prompt, None),
+    )
 
 
 def validate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tuple[PairSpec, ...]) -> None:
@@ -360,6 +468,22 @@ def evaluate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tupl
     output_path = pathlib.Path(args.output_jsonl)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     client = websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+    physical_prompts = None
+    if args.physical_prompt_dataset_root:
+        physical_prompts = _load_physical_prompts(
+            args.physical_prompt_dataset_root,
+            {
+                task.language
+                for spec in pair_specs
+                for _, task in (
+                    task_lookups[spec.suite][spec.task_a],
+                    task_lookups[spec.suite][spec.task_b],
+                )
+            },
+            num_frames=args.physical_prompt_frames,
+            seed=args.physical_prompt_seed,
+            action_horizon=args.action_horizon,
+        )
 
     for spec in pair_specs:
         task_suite = task_suites[spec.suite]
@@ -369,14 +493,10 @@ def evaluate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tupl
         initial_states = task_suite.get_task_init_states(task_id_a)
         env_a = _make_env(task_a, args.seed)
         env_b = _make_env(task_b, args.seed)
-        prompt_conditions = (
-            ("language_a", task_a.language, "a"),
-            ("language_b", task_b.language, "b"),
-            ("neutral_no_information", args.neutral_prompt, None),
-        )
+        prompt_conditions = _prompt_conditions(args, task_a, task_b, physical_prompts)
         try:
             for initial_state_index in args.initial_state_indices:
-                for condition_name, prompt, expected_goal in prompt_conditions:
+                for condition in prompt_conditions:
                     obs_a, _, initial_obs_differences, initial_state_difference = _reset_pair(
                         env_a, env_b, initial_states[initial_state_index], args.num_steps_wait
                     )
@@ -400,7 +520,14 @@ def evaluate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tupl
                                     args.action_horizon,
                                     args.action_dim,
                                 )
-                                element, image = _policy_observation(obs_a, prompt, args.resize_size, noise)
+                                element, image = _policy_observation(
+                                    obs_a,
+                                    condition.language,
+                                    args.resize_size,
+                                    noise,
+                                    condition.physical_prompt,
+                                    condition.action_order,
+                                )
                                 replay_images.append(image)
                                 action_chunk = client.infer(element)["actions"]
                                 if len(action_chunk) < args.replan_steps:
@@ -414,9 +541,7 @@ def evaluate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tupl
                             obs_a, _, done_a, _ = env_a.step(action)
                             _, _, done_b, _ = env_b.step(action)
                             steps_executed += 1
-                            max_dynamics_difference = max(
-                                max_dynamics_difference, _max_state_difference(env_a, env_b)
-                            )
+                            max_dynamics_difference = max(max_dynamics_difference, _max_state_difference(env_a, env_b))
                             if done_a or done_b:
                                 first_goal = "both" if done_a and done_b else ("a" if done_a else "b")
                                 break
@@ -424,14 +549,14 @@ def evaluate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tupl
                             episode_error = repr(error)
                             break
 
-                    success = expected_goal is not None and first_goal == expected_goal
+                    success = condition.expected_goal is not None and first_goal == condition.expected_goal
                     video_path = None
                     if args.save_video and replay_images:
                         import imageio
 
                         suffix = first_goal or "none"
                         video_path = pathlib.Path(args.video_out_path) / (
-                            f"{spec.pair_id}_init{initial_state_index}_{condition_name}_{suffix}.mp4"
+                            f"{spec.pair_id}_init{initial_state_index}_{condition.name}_{suffix}.mp4"
                         )
                         video_path.parent.mkdir(parents=True, exist_ok=True)
                         imageio.mimwrite(video_path, replay_images, fps=10)
@@ -448,9 +573,14 @@ def evaluate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tupl
                         "initial_state_index": initial_state_index,
                         "environment_seed": args.seed,
                         "inference_seed": args.inference_seed,
-                        "condition_name": condition_name,
-                        "policy_prompt": prompt,
-                        "expected_goal": expected_goal,
+                        "condition_name": condition.name,
+                        "policy_prompt": condition.language,
+                        "physical_prompt": (
+                            condition.physical_prompt.metadata(action_order=condition.action_order)
+                            if condition.physical_prompt is not None
+                            else None
+                        ),
+                        "expected_goal": condition.expected_goal,
                         "first_goal": first_goal,
                         "success": bool(success),
                         "steps": steps_executed,
@@ -495,6 +625,12 @@ def main() -> None:
     parser.add_argument("--num-steps-wait", type=int, default=10)
     parser.add_argument("--max-steps", type=int, default=400)
     parser.add_argument("--neutral-prompt", default=NEUTRAL_PROMPT)
+    parser.add_argument(
+        "--physical-prompt-dataset-root",
+        help="Enable sensorimotor-prompt conditions using this local LeRobot dataset root.",
+    )
+    parser.add_argument("--physical-prompt-frames", type=int, default=8)
+    parser.add_argument("--physical-prompt-seed", type=int, default=42)
     parser.add_argument("--output-jsonl")
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument("--video-out-path", default="/tmp/libero_counterfactual_videos")
