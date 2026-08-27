@@ -1,5 +1,6 @@
 import flax.nnx as nnx
 import jax
+import pytest
 
 import openpi.models.pi0_config as _pi0_config
 
@@ -44,3 +45,16 @@ def test_pi0_all_lora():
     assert len(state) == 17
     assert all("lora" not in p for p in state)
     assert all("llm" in p for p in state)
+
+
+def test_local_effect_tokens_require_effect_prompts():
+    with pytest.raises(ValueError, match="requires physical_prompt_effects"):
+        _pi0_config.Pi0Config(physical_prompt_frames=8, physical_prompt_local_effect_tokens=4)
+
+    config = _pi0_config.Pi0Config(
+        physical_prompt_frames=8,
+        physical_prompt_pool_grid=4,
+        physical_prompt_effects=True,
+        physical_prompt_local_effect_tokens=4,
+    )
+    assert config.physical_prompt_local_effect_tokens == 4

@@ -13,6 +13,20 @@ from openpi.training import config as _config
 from . import train
 
 
+def test_physical_prompt_rank_schedule_and_per_example_reduction():
+    config = dataclasses.replace(
+        _config._CONFIGS_DICT["debug"],  # noqa: SLF001
+        physical_prompt_rank_warmup_steps=10,
+        physical_prompt_rank_ramp_steps=20,
+    )
+
+    assert float(train._scheduled_rank_weight(config, 9, 0.2)) == 0.0  # noqa: SLF001
+    assert float(train._scheduled_rank_weight(config, 20, 0.2)) == pytest.approx(0.1)  # noqa: SLF001
+    assert float(train._scheduled_rank_weight(config, 30, 0.2)) == pytest.approx(0.2)  # noqa: SLF001
+    loss = jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4)
+    assert jnp.array_equal(train._per_example_loss(loss), jnp.array([5.5, 17.5]))  # noqa: SLF001
+
+
 def test_physical_prompt_interventions_only_change_the_prompt():
     observation = _model.Observation(
         images={

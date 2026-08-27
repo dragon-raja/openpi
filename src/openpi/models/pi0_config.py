@@ -42,6 +42,10 @@ class Pi0Config(_model.BaseModelConfig):
     # Encode action effects from explicit (pre-image, action, post-image)
     # transition units rather than independent frame-action pairs.
     physical_prompt_effects: bool = False
+    # Number of largest local post-minus-pre changes retained as separate
+    # action-gated tokens per prompt frame. Zero preserves the C1 global
+    # mean-effect fusion path.
+    physical_prompt_local_effect_tokens: int = 0
     # Carry an explicit wrong-task demonstration during training.  These
     # fields are ignored by inference and only materialized by the causal
     # ranking objective.
@@ -60,6 +64,12 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("physical_prompt_pool_grid must be a positive divisor of 16")
         if self.physical_prompt_effects and not self.physical_prompt_frames:
             raise ValueError("physical_prompt_effects requires physical_prompt_frames > 0")
+        if self.physical_prompt_local_effect_tokens < 0:
+            raise ValueError("physical_prompt_local_effect_tokens must be non-negative")
+        if self.physical_prompt_local_effect_tokens and not self.physical_prompt_effects:
+            raise ValueError("physical_prompt_local_effect_tokens requires physical_prompt_effects")
+        if self.physical_prompt_local_effect_tokens > self.physical_prompt_pool_grid**2:
+            raise ValueError("physical_prompt_local_effect_tokens cannot exceed the pooled visual token count")
         if self.physical_prompt_counterfactuals and not self.physical_prompt_frames:
             raise ValueError("physical_prompt_counterfactuals requires physical_prompt_frames > 0")
         if self.pytorch_compile_mode is not None:
@@ -179,6 +189,9 @@ class Pi0Config(_model.BaseModelConfig):
                     jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames], bool)
                     if self.physical_prompt_counterfactuals
                     else None
+                ),
+                physical_prompt_rank_mask=(
+                    jax.ShapeDtypeStruct([batch_size], bool) if self.physical_prompt_counterfactuals else None
                 ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)

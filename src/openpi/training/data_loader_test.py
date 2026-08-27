@@ -108,6 +108,26 @@ def test_physical_prompt_dataset_supplies_an_explicit_wrong_task():
     assert int(item["physical_prompt_counterfactual_task_index"]) == 1
     assert item["physical_prompt_counterfactual_images"].shape == (3, 3, 2, 2)
     assert not torch.equal(item["physical_prompt_images"], item["physical_prompt_counterfactual_images"])
+    assert bool(item["physical_prompt_rank_mask"])
+
+
+def test_physical_prompt_dataset_masks_easy_negatives_and_builds_language_anchors():
+    dataset = _data_loader.PhysicalPromptDataset(
+        _CounterfactualPromptDatasetFixture(),
+        num_frames=3,
+        seed=7,
+        include_effects=True,
+        include_counterfactuals=True,
+        hard_negatives_only=True,
+        language_anchor_fraction=1.0,
+    )
+
+    item = dataset[0]
+
+    assert item["prompt"] == "task zero"
+    assert not item["physical_prompt_mask"].any()
+    assert int(item["physical_prompt_counterfactual_task_index"]) == 0
+    assert not bool(item["physical_prompt_rank_mask"])
 
 
 def test_episode_block_sampler_preserves_blocks_and_changes_epoch_order():

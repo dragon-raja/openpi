@@ -70,6 +70,7 @@ class Pi0(_model.BaseModel):
         self.physical_prompt_frames = config.physical_prompt_frames
         self.physical_prompt_pool_grid = config.physical_prompt_pool_grid
         self.physical_prompt_effects = config.physical_prompt_effects
+        self.physical_prompt_local_effect_tokens = config.physical_prompt_local_effect_tokens
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -113,6 +114,15 @@ class Pi0(_model.BaseModel):
                 self.physical_prompt_effect_down = nnx.Linear(paligemma_config.width, effect_width, rngs=rngs)
                 self.physical_prompt_effect_gate = nnx.Linear(paligemma_config.width, effect_width, rngs=rngs)
                 self.physical_prompt_effect_up = nnx.Linear(effect_width, paligemma_config.width, rngs=rngs)
+                if config.physical_prompt_local_effect_tokens:
+                    self.physical_prompt_effect_token_embedding = nnx.Param(
+                        jax.random.normal(
+                            rngs.params(),
+                            (config.physical_prompt_local_effect_tokens, paligemma_config.width),
+                            dtype=jnp.float32,
+                        )
+                        * 0.02
+                    )
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -202,22 +212,51 @@ class Pi0(_model.BaseModel):
 
                 action_token = self.physical_prompt_action_in_proj(obs.physical_prompt_actions[:, frame])
                 effect_mask = jnp.logical_and(obs.physical_prompt_action_mask[:, frame], obs.image_masks[name])
+                local_effect_tokens = None
                 if self.physical_prompt_effects:
                     post_name = prompt_post_names[frame]
                     post_tokens = pool_prompt_image(post_name)
-                    # The compact transition adapter makes the demonstrated
-                    # effect explicit while retaining the spatial pre-action
-                    # tokens.  Action-dependent gating prevents the post-state
-                    # difference from becoming an action-agnostic goal image.
-                    effect_delta = jnp.mean(post_tokens - pre_tokens, axis=1)
-                    effect_latent = jax.nn.gelu(self.physical_prompt_effect_down(effect_delta))
                     action_gate = jax.nn.sigmoid(self.physical_prompt_effect_gate(action_token))
-                    action_token = action_token + self.physical_prompt_effect_up(effect_latent * action_gate)
                     effect_mask = jnp.logical_and(effect_mask, obs.image_masks[post_name])
+                    patch_effects = post_tokens - pre_tokens
+                    if self.physical_prompt_local_effect_tokens:
+                        # Retain the strongest spatial changes instead of
+                        # averaging away contacts and object motion. SigLIP is
+                        # frozen, so deterministic top-k routing does not hide
+                        # a trainable selection shortcut.
+                        _, effect_indices = jax.lax.top_k(
+                            jnp.linalg.norm(patch_effects, axis=-1),
+                            self.physical_prompt_local_effect_tokens,
+                        )
+                        selected_effects = jnp.take_along_axis(
+                            patch_effects,
+                            effect_indices[..., None],
+                            axis=1,
+                        )
+                        effect_latent = jax.nn.gelu(self.physical_prompt_effect_down(selected_effects))
+                        local_effect_tokens = self.physical_prompt_effect_up(effect_latent * action_gate[:, None, :])
+                        local_effect_tokens += self.physical_prompt_effect_token_embedding.value[None, :, :]
+                    else:
+                        # C1 compatibility path: fuse one global mean effect
+                        # directly into the aligned action token.
+                        effect_delta = jnp.mean(patch_effects, axis=1)
+                        effect_latent = jax.nn.gelu(self.physical_prompt_effect_down(effect_delta))
+                        action_token = action_token + self.physical_prompt_effect_up(effect_latent * action_gate)
                 action_token = action_token[:, None, :] + position[None, None, :]
                 tokens.append(action_token)
                 input_mask.append(effect_mask[:, None])
                 ar_mask += [False]
+                if local_effect_tokens is not None:
+                    local_effect_tokens += position[None, None, :]
+                    tokens.append(local_effect_tokens)
+                    input_mask.append(
+                        einops.repeat(
+                            effect_mask,
+                            "b -> b s",
+                            s=self.physical_prompt_local_effect_tokens,
+                        )
+                    )
+                    ar_mask += [False] * self.physical_prompt_local_effect_tokens
 
             tokens.append(
                 jnp.broadcast_to(

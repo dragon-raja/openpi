@@ -70,3 +70,17 @@ The three same-physics counterfactual task pairs qualified by the evaluator use 
 tasks receive deterministic different-task negatives. This is still a mechanism experiment: evaluate with
 `counterfactual_pair_eval.py --physical-prompt-effects` and require both prompt switching and a positive aligned-minus-
 reversed action gap before scaling training or moving to LIBERO-Plus.
+
+## Causal ICL curriculum
+
+The config `pi05_libero_causal_icl_curriculum_lora` is the behavior-preserving C2 test. It restarts from the released
+Pi0.5 checkpoint rather than inheriting the failed C1 weights. Four action-gated local change tokens retain the
+strongest pooled `post-image - pre-image` patches per frame; C1's global mean-effect fusion remains available when
+`physical_prompt_local_effect_tokens=0`.
+
+The first 150 steps are behavior cloning only. A deterministic 25% of samples use the original task language with all
+physical-prompt tokens masked, anchoring the released language-conditioned behavior. From step 150 to 299, wrong-task
+and reversed-action rankings ramp linearly from zero to 0.15. Ranking is computed per example, normalized by the
+matched-noise denoising-loss scale, and enabled only for the three evaluator-qualified same-physics task pairs. Keep
+both step 150 and step 299: the former isolates the representation and behavior curriculum, while the latter measures
+the causal ranking intervention.

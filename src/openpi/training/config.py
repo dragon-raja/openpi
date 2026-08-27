@@ -102,6 +102,8 @@ class DataConfig:
     physical_prompt_block_size: int = 32
     physical_prompt_effects: bool = False
     physical_prompt_counterfactuals: bool = False
+    physical_prompt_hard_negatives_only: bool = False
+    physical_prompt_language_anchor_fraction: float = 0.0
 
     # Only used for RLDS data loader (ie currently only used for DROID).
     rlds_data_dir: str | None = None
@@ -351,6 +353,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     physical_prompt_block_size: int = 32
     physical_prompt_effects: bool = False
     physical_prompt_counterfactuals: bool = False
+    physical_prompt_hard_negatives_only: bool = False
+    physical_prompt_language_anchor_fraction: float = 0.0
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -403,6 +407,7 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
                         "physical_prompt/counterfactual_images": "physical_prompt_counterfactual_images",
                         "physical_prompt/counterfactual_actions": "physical_prompt_counterfactual_actions",
                         "physical_prompt/counterfactual_mask": "physical_prompt_counterfactual_mask",
+                        "physical_prompt/rank_mask": "physical_prompt_rank_mask",
                     }
                 )
                 if self.physical_prompt_effects:
@@ -478,6 +483,8 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             physical_prompt_block_size=self.physical_prompt_block_size,
             physical_prompt_effects=self.physical_prompt_effects,
             physical_prompt_counterfactuals=self.physical_prompt_counterfactuals,
+            physical_prompt_hard_negatives_only=self.physical_prompt_hard_negatives_only,
+            physical_prompt_language_anchor_fraction=self.physical_prompt_language_anchor_fraction,
         )
 
 
@@ -695,6 +702,10 @@ class TrainConfig:
     physical_prompt_counterfactual_rank_weight: float = 0.0
     physical_prompt_action_rank_weight: float = 0.0
     physical_prompt_rank_margin: float = 0.02
+    physical_prompt_rank_warmup_steps: int = 0
+    physical_prompt_rank_ramp_steps: int = 0
+    physical_prompt_rank_normalize: bool = False
+    physical_prompt_rank_scale_floor: float = 0.05
 
     # Used to pass metadata to the policy server.
     policy_metadata: dict[str, Any] | None = None
@@ -729,6 +740,10 @@ class TrainConfig:
             raise ValueError("Physical-prompt ranking weights must be non-negative")
         if self.physical_prompt_rank_margin < 0:
             raise ValueError("Physical-prompt ranking margin must be non-negative")
+        if self.physical_prompt_rank_warmup_steps < 0 or self.physical_prompt_rank_ramp_steps < 0:
+            raise ValueError("Physical-prompt ranking schedule steps must be non-negative")
+        if self.physical_prompt_rank_scale_floor <= 0:
+            raise ValueError("Physical-prompt ranking scale floor must be positive")
         if (self.physical_prompt_counterfactual_rank_weight or self.physical_prompt_action_rank_weight) and not getattr(
             self.model, "physical_prompt_frames", 0
         ):
@@ -1082,6 +1097,72 @@ _CONFIGS = [
         physical_prompt_counterfactual_rank_weight=0.5,
         physical_prompt_action_rank_weight=0.5,
         physical_prompt_rank_margin=0.02,
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_libero_causal_icl_curriculum_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            physical_prompt_frames=8,
+            physical_prompt_pool_grid=4,
+            physical_prompt_effects=True,
+            physical_prompt_local_effect_tokens=4,
+            physical_prompt_counterfactuals=True,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(
+                assets_dir=_pi05_libero_checkpoint_path("assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            physical_prompt_frames=8,
+            physical_prompt_seed=42,
+            physical_prompt_language="Follow the demonstrated behavior.",
+            physical_prompt_effects=True,
+            physical_prompt_counterfactuals=True,
+            physical_prompt_hard_negatives_only=True,
+            physical_prompt_language_anchor_fraction=0.25,
+            extra_delta_transform=False,
+        ),
+        batch_size=6,
+        num_workers=0,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=3e-5,
+            decay_steps=300,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _pi05_libero_checkpoint_path("params"),
+            missing_regex=".*(lora|physical_prompt).*",
+        ),
+        num_train_steps=300,
+        save_interval=150,
+        keep_period=150,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            physical_prompt_frames=8,
+            physical_prompt_pool_grid=4,
+            physical_prompt_effects=True,
+            physical_prompt_local_effect_tokens=4,
+            physical_prompt_counterfactuals=True,
+        ).get_physical_prompt_freeze_filter(),
+        physical_prompt_counterfactual_rank_weight=0.15,
+        physical_prompt_action_rank_weight=0.15,
+        physical_prompt_rank_margin=0.10,
+        physical_prompt_rank_warmup_steps=150,
+        physical_prompt_rank_ramp_steps=149,
+        physical_prompt_rank_normalize=True,
+        physical_prompt_rank_scale_floor=0.05,
         ema_decay=None,
     ),
     TrainConfig(

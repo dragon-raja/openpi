@@ -121,6 +121,22 @@ def _intervene_physical_prompt(
     )
 
 
+def _scheduled_rank_weight(config: _config.TrainConfig, step: at.ArrayLike, maximum: float) -> at.Array:
+    """Linearly enable a causal rank objective after behavior warmup."""
+    step = jnp.asarray(step, dtype=jnp.float32)
+    warmup = float(config.physical_prompt_rank_warmup_steps)
+    if config.physical_prompt_rank_ramp_steps:
+        progress = jnp.clip((step - warmup) / config.physical_prompt_rank_ramp_steps, 0.0, 1.0)
+    else:
+        progress = jnp.asarray(step >= warmup, dtype=jnp.float32)
+    return jnp.asarray(maximum, dtype=jnp.float32) * progress
+
+
+def _per_example_loss(loss: at.Array) -> at.Array:
+    """Reduce a diffusion loss over every axis except the batch axis."""
+    return jnp.mean(loss, axis=tuple(range(1, loss.ndim)))
+
+
 @at.typecheck
 def init_train_state(
     config: _config.TrainConfig, init_rng: at.KeyArrayLike, mesh: jax.sharding.Mesh, *, resume: bool
@@ -188,49 +204,74 @@ def train_step(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        per_example_loss = _per_example_loss(chunked_loss)
+        return jnp.mean(per_example_loss), per_example_loss
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
     # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    bc_loss, grads = nnx.value_and_grad(behavior_cloning_loss_fn, argnums=diff_state)(
-        model, train_rng, observation, actions
-    )
+    (bc_loss, bc_per_example), grads = nnx.value_and_grad(
+        behavior_cloning_loss_fn,
+        argnums=diff_state,
+        has_aux=True,
+    )(model, train_rng, observation, actions)
     loss = bc_loss
     rank_info = {}
+    rank_mask = observation.physical_prompt_rank_mask
+    if rank_mask is None:
+        rank_mask = jnp.ones_like(bc_per_example, dtype=bool)
+    rank_mask_float = rank_mask.astype(jnp.float32)
+    rank_count = jnp.sum(rank_mask_float)
+    safe_rank_count = jnp.maximum(rank_count, 1.0)
 
-    def add_ranking_gradient(intervened_observation, *, weight: float, name: str):
+    def add_ranking_gradient(intervened_observation, *, maximum_weight: float, name: str):
         nonlocal grads, loss
 
         def ranking_loss_fn(model, rng, observation, actions):
-            counterfactual_loss = jnp.mean(model.compute_loss(rng, observation, actions, train=True))
-            ranking_loss = jax.nn.relu(
-                config.physical_prompt_rank_margin + jax.lax.stop_gradient(bc_loss) - counterfactual_loss
-            )
-            return ranking_loss, counterfactual_loss
+            counterfactual_per_example = _per_example_loss(model.compute_loss(rng, observation, actions, train=True))
+            stopped_bc = jax.lax.stop_gradient(bc_per_example)
+            raw_gap = counterfactual_per_example - stopped_bc
+            if config.physical_prompt_rank_normalize:
+                # A symmetric stopped scale makes the margin comparable across
+                # diffusion timesteps without creating a denominator shortcut.
+                scale = jax.lax.stop_gradient(0.5 * (jnp.abs(stopped_bc) + jnp.abs(counterfactual_per_example)))
+                scale = jnp.maximum(scale, config.physical_prompt_rank_scale_floor)
+                gap = raw_gap / scale
+            else:
+                gap = raw_gap
+            rank_per_example = jax.nn.relu(config.physical_prompt_rank_margin - gap)
+            ranking_loss = jnp.sum(rank_per_example * rank_mask_float) / safe_rank_count
+            valid_counterfactual_loss = jnp.sum(counterfactual_per_example * rank_mask_float) / safe_rank_count
+            valid_gap = jnp.sum(gap * rank_mask_float) / safe_rank_count
+            active = jnp.sum((rank_per_example > 0).astype(jnp.float32) * rank_mask_float) / safe_rank_count
+            return ranking_loss, (valid_counterfactual_loss, valid_gap, active)
 
-        (ranking_loss, counterfactual_loss), ranking_grads = nnx.value_and_grad(
+        (ranking_loss, (counterfactual_loss, ranking_gap, ranking_active)), ranking_grads = nnx.value_and_grad(
             ranking_loss_fn,
             argnums=diff_state,
             has_aux=True,
         )(model, train_rng, intervened_observation, actions)
+        weight = _scheduled_rank_weight(config, state.step, maximum_weight)
         grads = jax.tree.map(lambda base, rank: base + weight * rank, grads, ranking_grads)
         loss = loss + weight * ranking_loss
         rank_info[f"{name}_loss"] = counterfactual_loss
         rank_info[f"{name}_rank"] = ranking_loss
+        rank_info[f"{name}_gap"] = ranking_gap
+        rank_info[f"{name}_active"] = ranking_active
+        rank_info[f"{name}_weight"] = weight
 
     if config.physical_prompt_counterfactual_rank_weight:
         add_ranking_gradient(
             _intervene_physical_prompt(observation, use_counterfactual=True),
-            weight=config.physical_prompt_counterfactual_rank_weight,
+            maximum_weight=config.physical_prompt_counterfactual_rank_weight,
             name="counterfactual_prompt",
         )
     if config.physical_prompt_action_rank_weight:
         add_ranking_gradient(
             _intervene_physical_prompt(observation, reverse_actions=True),
-            weight=config.physical_prompt_action_rank_weight,
+            maximum_weight=config.physical_prompt_action_rank_weight,
             name="reversed_action",
         )
 
@@ -263,6 +304,7 @@ def train_step(
     info = {
         "loss": loss,
         "bc_loss": bc_loss,
+        "physical_prompt_rank_valid_fraction": jnp.mean(rank_mask_float),
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
         **rank_info,

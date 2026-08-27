@@ -76,6 +76,7 @@ def test_counterfactual_prompt_is_kept_out_of_the_live_image_dict() -> None:
             "physical_prompt/counterfactual_post_images": np.full((3, 3, 24, 32), 0.75, dtype=np.float32),
             "physical_prompt/counterfactual_actions": np.ones((3, 7), dtype=np.float32),
             "physical_prompt/counterfactual_mask": np.ones(3, dtype=bool),
+            "physical_prompt/rank_mask": np.True_,
         }
     )
 
@@ -84,3 +85,4 @@ def test_counterfactual_prompt_is_kept_out_of_the_live_image_dict() -> None:
     assert "physical_prompt_counterfactual_images" in result
     assert not any("counterfactual" in key for key in result["image"])
     assert result["physical_prompt_counterfactual_actions"].shape == (3, 7)
+    assert bool(result["physical_prompt_rank_mask"])

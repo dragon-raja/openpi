@@ -209,6 +209,9 @@ class LiberoInputs(transforms.DataTransformFn):
                 inputs["physical_prompt_counterfactual_image_masks"] = counterfactual_image_mask_dict
                 inputs["physical_prompt_counterfactual_actions"] = counterfactual_actions
                 inputs["physical_prompt_counterfactual_action_mask"] = counterfactual_action_mask
+                inputs["physical_prompt_rank_mask"] = np.asarray(
+                    data.get("physical_prompt/rank_mask", False), dtype=bool
+                )
 
         # Pad actions to the model action dimension. Keep this for your own dataset.
         # Actions are only available during training.

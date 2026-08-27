@@ -267,14 +267,22 @@ class PhysicalPromptDataset(Dataset):
         seed: int = 0,
         include_effects: bool = False,
         include_counterfactuals: bool = False,
+        hard_negatives_only: bool = False,
+        language_anchor_fraction: float = 0.0,
     ):
         if num_frames <= 0:
             raise ValueError("num_frames must be positive")
+        if not 0.0 <= language_anchor_fraction <= 1.0:
+            raise ValueError("language_anchor_fraction must be in [0, 1]")
+        if hard_negatives_only and not include_counterfactuals:
+            raise ValueError("hard_negatives_only requires include_counterfactuals")
         self._dataset = dataset
         self._num_frames = num_frames
         self._seed = seed
         self._include_effects = include_effects
         self._include_counterfactuals = include_counterfactuals
+        self._hard_negatives_only = hard_negatives_only
+        self._language_anchor_fraction = language_anchor_fraction
 
         task_index_by_text = {task: task_index for task_index, task in dataset.meta.tasks.items()}
         task_to_episodes: dict[int, list[int]] = {}
@@ -336,23 +344,47 @@ class PhysicalPromptDataset(Dataset):
 
         prompt_images, prompt_actions, prompt_post_images = self._load_prompt(task_index, demo_episode)
 
+        # A deterministic fraction of examples keeps the released
+        # language-conditioned behavior alive while learning a new prompt
+        # pathway. Their physical prompts are fully masked, so they cannot
+        # satisfy the prompt objective through an accidental mixed cue.
+        # Knuth's multiplicative hash mixes adjacent parquet rows; a simple
+        # modulo hash would create long all-anchor/all-prompt runs because the
+        # sampler intentionally preserves contiguous read blocks.
+        anchor_bucket = ((query_index + self._seed * 97_409) * 2_654_435_761) & 0xFFFFFFFF
+        is_language_anchor = anchor_bucket < int(self._language_anchor_fraction * 2**32)
+        prompt_mask = (
+            torch.zeros(self._num_frames, dtype=torch.bool)
+            if is_language_anchor
+            else torch.ones(self._num_frames, dtype=torch.bool)
+        )
+
         result = {
             **query,
             "physical_prompt_images": prompt_images,
             "physical_prompt_actions": prompt_actions,
-            "physical_prompt_mask": torch.ones(self._num_frames, dtype=torch.bool),
+            "physical_prompt_mask": prompt_mask,
             "physical_prompt_episode_index": np.int64(demo_episode),
         }
+        if is_language_anchor:
+            result["prompt"] = self._dataset.meta.tasks[task_index]
         if prompt_post_images is not None:
             result["physical_prompt_post_images"] = prompt_post_images
         if self._include_counterfactuals:
             task_text = self._dataset.meta.tasks[task_index]
             counterfactual_text = _LIBERO_COUNTERFACTUAL_TASK_PAIRS.get(task_text)
             if counterfactual_text is None:
-                task_indices = sorted(self._task_to_episodes)
-                counterfactual_task = task_indices[(task_indices.index(task_index) + 1) % len(task_indices)]
+                if self._hard_negatives_only:
+                    # Preserve static shapes without introducing a trivial
+                    # cross-scene negative. The rank mask below removes this
+                    # example from both causal ranking objectives.
+                    counterfactual_task = task_index
+                else:
+                    task_indices = sorted(self._task_to_episodes)
+                    counterfactual_task = task_indices[(task_indices.index(task_index) + 1) % len(task_indices)]
             else:
                 counterfactual_task = self._task_index_by_text[counterfactual_text]
+            rank_valid = (counterfactual_text is not None or not self._hard_negatives_only) and not is_language_anchor
             counterfactual_candidates = self._task_to_episodes[counterfactual_task]
             counterfactual_choice = (self._seed + counterfactual_task * 1_000_003) % len(counterfactual_candidates)
             counterfactual_episode = counterfactual_candidates[counterfactual_choice]
@@ -366,6 +398,7 @@ class PhysicalPromptDataset(Dataset):
                     "physical_prompt_counterfactual_mask": torch.ones(self._num_frames, dtype=torch.bool),
                     "physical_prompt_counterfactual_episode_index": np.int64(counterfactual_episode),
                     "physical_prompt_counterfactual_task_index": np.int64(counterfactual_task),
+                    "physical_prompt_rank_mask": np.bool_(rank_valid),
                 }
             )
             if counterfactual_post_images is not None:
@@ -519,6 +552,8 @@ def create_torch_dataset(
             seed=data_config.physical_prompt_seed,
             include_effects=data_config.physical_prompt_effects,
             include_counterfactuals=data_config.physical_prompt_counterfactuals,
+            hard_negatives_only=data_config.physical_prompt_hard_negatives_only,
+            language_anchor_fraction=data_config.physical_prompt_language_anchor_fraction,
         )
         dataset = TransformedDataset(
             dataset,

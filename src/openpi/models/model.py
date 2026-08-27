@@ -109,6 +109,10 @@ class Observation(Generic[ArrayT]):
     physical_prompt_counterfactual_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
     physical_prompt_counterfactual_actions: at.Float[ArrayT, "*b p a"] | None = None
     physical_prompt_counterfactual_action_mask: at.Bool[ArrayT, "*b p"] | None = None
+    # Per-example training mask for causal ranking. False examples still
+    # contribute behavior cloning but cannot supply a strict same-physics
+    # negative (or are language behavior anchors).
+    physical_prompt_rank_mask: at.Bool[ArrayT, "*b"] | None = None
 
     # pi0-fast model specific fields.
 
@@ -155,6 +159,7 @@ class Observation(Generic[ArrayT]):
             physical_prompt_counterfactual_image_masks=data.get("physical_prompt_counterfactual_image_masks"),
             physical_prompt_counterfactual_actions=data.get("physical_prompt_counterfactual_actions"),
             physical_prompt_counterfactual_action_mask=data.get("physical_prompt_counterfactual_action_mask"),
+            physical_prompt_rank_mask=data.get("physical_prompt_rank_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
         )
@@ -246,6 +251,7 @@ def preprocess_observation(
         physical_prompt_counterfactual_image_masks=observation.physical_prompt_counterfactual_image_masks,
         physical_prompt_counterfactual_actions=observation.physical_prompt_counterfactual_actions,
         physical_prompt_counterfactual_action_mask=observation.physical_prompt_counterfactual_action_mask,
+        physical_prompt_rank_mask=observation.physical_prompt_rank_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
     )
