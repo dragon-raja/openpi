@@ -85,6 +85,14 @@ def test_behavior_binding_requires_exact_multistep_effects():
     assert observation.physical_prompt_action_mask.shape == (2, 8, 8)
     assert observation.physical_prompt_counterfactual_actions.shape == (2, 8, 8, config.action_dim)
 
+    with pytest.raises(ValueError, match="requires a behavior latent"):
+        _pi0_config.Pi0Config(
+            physical_prompt_frames=8,
+            physical_prompt_effects=True,
+            physical_prompt_effect_horizons=(1, 2),
+            physical_prompt_directed_action_flow=True,
+        )
+
 
 def test_safe_l2_normalize_has_finite_zero_vector_gradient():
     value = jnp.zeros((2, 256), dtype=jnp.float32)
@@ -93,3 +101,16 @@ def test_safe_l2_normalize_has_finite_zero_vector_gradient():
 
     assert jnp.array_equal(normalized, value)
     assert jnp.all(jnp.isfinite(gradient))
+
+
+def test_masked_action_flow_changes_sign_under_valid_prefix_reversal():
+    tokens = jnp.array([[[0.0], [1.0], [3.0], [99.0]], [[4.0], [9.0], [99.0], [99.0]]])
+    mask = jnp.array([[True, True, True, False], [True, False, False, False]])
+    reversed_tokens = jnp.array([[[3.0], [1.0], [0.0], [99.0]], [[4.0], [9.0], [99.0], [99.0]]])
+
+    forward = _pi0._masked_action_flow(tokens, mask)  # noqa: SLF001
+    backward = _pi0._masked_action_flow(reversed_tokens, mask)  # noqa: SLF001
+
+    assert jnp.allclose(forward[0], -backward[0])
+    assert jnp.array_equal(forward[1], jnp.zeros(1))
+    assert jnp.array_equal(backward[1], jnp.zeros(1))

@@ -22,6 +22,15 @@ def _safe_l2_normalize(value, *, epsilon: float = 1e-6):
     return value * jax.lax.rsqrt(squared_norm + epsilon)
 
 
+def _masked_action_flow(action_tokens, action_mask):
+    """Mean directed adjacent difference over the valid action prefix."""
+    pair_mask = jnp.logical_and(action_mask[:, 1:], action_mask[:, :-1])
+    differences = action_tokens[:, 1:] - action_tokens[:, :-1]
+    mask = pair_mask.astype(differences.dtype)
+    denominator = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1.0)
+    return jnp.sum(differences * mask[..., None], axis=1) / denominator
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -79,6 +88,8 @@ class Pi0(_model.BaseModel):
         self.physical_prompt_effect_horizons = config.physical_prompt_effect_horizons
         self.physical_prompt_local_effect_tokens = config.physical_prompt_local_effect_tokens
         self.physical_prompt_behavior_latent_dim = config.physical_prompt_behavior_latent_dim
+        self.physical_prompt_directed_action_flow = config.physical_prompt_directed_action_flow
+        self.physical_prompt_cross_modal_behavior_binding = config.physical_prompt_cross_modal_behavior_binding
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -146,6 +157,11 @@ class Pi0(_model.BaseModel):
                     paligemma_config.width, temporal_width, rngs=rngs
                 )
                 self.physical_prompt_action_temporal_up = nnx.Linear(temporal_width, paligemma_config.width, rngs=rngs)
+                if config.physical_prompt_directed_action_flow:
+                    self.physical_prompt_action_flow_down = nnx.Linear(
+                        paligemma_config.width, temporal_width, rngs=rngs
+                    )
+                    self.physical_prompt_action_flow_up = nnx.Linear(temporal_width, paligemma_config.width, rngs=rngs)
             if config.physical_prompt_behavior_latent_dim:
                 self.physical_prompt_behavior_down = nnx.Linear(
                     paligemma_config.width, config.physical_prompt_behavior_latent_dim, rngs=rngs
@@ -187,6 +203,20 @@ class Pi0(_model.BaseModel):
             pw=pool,
         )
 
+    def _encode_action_sequence(self, actions, action_mask, position_embedding):
+        action_tokens = self.physical_prompt_action_in_proj(actions)
+        positions = position_embedding[: actions.shape[1]]
+        temporal = jax.nn.gelu(self.physical_prompt_action_temporal_down(action_tokens + positions[None, :, :]))
+        temporal = self.physical_prompt_action_temporal_up(temporal)
+        mask = action_mask.astype(temporal.dtype)
+        denominator = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1.0)
+        action_token = jnp.sum(temporal * mask[..., None], axis=1) / denominator
+        if self.physical_prompt_directed_action_flow:
+            directed_flow = _masked_action_flow(action_tokens, action_mask)
+            directed_flow = jax.nn.gelu(self.physical_prompt_action_flow_down(directed_flow))
+            action_token += self.physical_prompt_action_flow_up(directed_flow)
+        return action_token
+
     def _encode_physical_prompt_action(self, actions, action_mask):
         if actions.ndim == 2:
             return self.physical_prompt_action_in_proj(actions), action_mask
@@ -194,14 +224,21 @@ class Pi0(_model.BaseModel):
             raise ValueError(
                 "Multi-step prompt actions and masks must have shapes [batch, horizon, action] and [batch, horizon]"
             )
-        action_tokens = self.physical_prompt_action_in_proj(actions)
-        positions = self.physical_prompt_action_temporal_position_embedding.value[: actions.shape[1]]
-        temporal = jax.nn.gelu(self.physical_prompt_action_temporal_down(action_tokens + positions[None, :, :]))
-        temporal = self.physical_prompt_action_temporal_up(temporal)
-        mask = action_mask.astype(temporal.dtype)
-        denominator = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1.0)
-        action_token = jnp.sum(temporal * mask[..., None], axis=1) / denominator
+        action_token = self._encode_action_sequence(
+            actions,
+            action_mask,
+            self.physical_prompt_action_temporal_position_embedding.value,
+        )
         return action_token, jnp.any(action_mask, axis=1)
+
+    def _behavior_frame_representation(self, pre_tokens, post_tokens, action_token):
+        visual_summary = jnp.mean(pre_tokens, axis=1)
+        effect_summary = jnp.mean(post_tokens - pre_tokens, axis=1)
+        if self.physical_prompt_cross_modal_behavior_binding:
+            effect_latent = jax.nn.gelu(self.physical_prompt_effect_down(effect_summary))
+            action_gate = 2.0 * jax.nn.sigmoid(self.physical_prompt_effect_gate(action_token))
+            effect_summary = self.physical_prompt_effect_up(effect_latent * action_gate)
+        return action_token + visual_summary + effect_summary
 
     def _pool_behavior_frames(self, frame_representations, frame_masks):
         frames = jnp.stack(frame_representations, axis=1)
@@ -233,9 +270,7 @@ class Pi0(_model.BaseModel):
             )
             effect_mask = jnp.logical_and(action_valid, obs.image_masks[name])
             effect_mask = jnp.logical_and(effect_mask, obs.image_masks[post_name])
-            effect_summary = jnp.mean(post_tokens - pre_tokens, axis=1)
-            visual_summary = jnp.mean(pre_tokens, axis=1)
-            frame_representations.append(action_token + visual_summary + effect_summary)
+            frame_representations.append(self._behavior_frame_representation(pre_tokens, post_tokens, action_token))
             frame_masks.append(effect_mask)
         return self._pool_behavior_frames(frame_representations, frame_masks)
 
@@ -243,12 +278,13 @@ class Pi0(_model.BaseModel):
         """Encode the supervised query action chunk in the same behavior space."""
         if not self.physical_prompt_behavior_latent_dim:
             raise ValueError("Physical-prompt behavior binding is disabled")
-        action_tokens = self.physical_prompt_action_in_proj(actions)
-        positions = self.physical_prompt_query_action_position_embedding.value[: actions.shape[1]]
-        temporal = jax.nn.gelu(self.physical_prompt_action_temporal_down(action_tokens + positions[None, :, :]))
-        temporal = self.physical_prompt_action_temporal_up(temporal)
-        pooled = jnp.mean(temporal, axis=1)
-        latent = self.physical_prompt_behavior_down(pooled)
+        action_mask = jnp.ones(actions.shape[:2], dtype=bool)
+        action_token = self._encode_action_sequence(
+            actions,
+            action_mask,
+            self.physical_prompt_query_action_position_embedding.value,
+        )
+        latent = self.physical_prompt_behavior_down(action_token)
         return _safe_l2_normalize(latent)
 
     @at.typecheck
@@ -346,7 +382,7 @@ class Pi0(_model.BaseModel):
                         action_token = action_token + self.physical_prompt_effect_up(effect_latent * action_gate)
                     if self.physical_prompt_behavior_latent_dim:
                         behavior_frames.append(
-                            action_token + jnp.mean(pre_tokens, axis=1) + jnp.mean(patch_effects, axis=1)
+                            self._behavior_frame_representation(pre_tokens, post_tokens, action_token)
                         )
                         behavior_masks.append(effect_mask)
                 action_token = action_token[:, None, :] + position[None, None, :]

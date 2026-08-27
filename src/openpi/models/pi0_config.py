@@ -52,6 +52,12 @@ class Pi0Config(_model.BaseModelConfig):
     # Width of the explicit behavior-binding bottleneck. Zero disables the C3
     # behavior token and retrieval objective.
     physical_prompt_behavior_latent_dim: int = 0
+    # Add an explicit mean adjacent-action difference. Unlike positional mean
+    # pooling, this feature changes direction under a padding-safe reversal.
+    physical_prompt_directed_action_flow: bool = False
+    # Bind the visual post-minus-pre effect to the aligned action through a
+    # multiplicative gate before forming the behavior latent.
+    physical_prompt_cross_modal_behavior_binding: bool = False
     # Carry an explicit wrong-task demonstration during training.  These
     # fields are ignored by inference and only materialized by the causal
     # ranking objective.
@@ -86,6 +92,10 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("physical_prompt_behavior_latent_dim must be non-negative")
         if self.physical_prompt_behavior_latent_dim and not self.physical_prompt_effect_horizons:
             raise ValueError("physical_prompt_behavior_latent_dim requires multi-step physical-prompt effects")
+        if self.physical_prompt_directed_action_flow and not self.physical_prompt_behavior_latent_dim:
+            raise ValueError("physical_prompt_directed_action_flow requires a behavior latent")
+        if self.physical_prompt_cross_modal_behavior_binding and not self.physical_prompt_behavior_latent_dim:
+            raise ValueError("physical_prompt_cross_modal_behavior_binding requires a behavior latent")
         if self.physical_prompt_counterfactuals and not self.physical_prompt_frames:
             raise ValueError("physical_prompt_counterfactuals requires physical_prompt_frames > 0")
         if self.pytorch_compile_mode is not None:
