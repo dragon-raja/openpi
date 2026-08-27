@@ -94,6 +94,23 @@ def test_physical_prompt_dataset_builds_action_effect_transitions():
     assert item["physical_prompt_actions"][:, 0].tolist() == [4.0, 6.0]
 
 
+def test_physical_prompt_dataset_builds_exact_multiscale_action_chunks():
+    dataset = _data_loader.PhysicalPromptDataset(
+        _PromptDatasetFixture(),
+        num_frames=2,
+        seed=7,
+        include_effects=True,
+        effect_horizons=(1, 2),
+    )
+
+    item = dataset[0]
+
+    assert item["physical_prompt_images"][:, 0, 0, 0].tolist() == [4.0, 5.0]
+    assert item["physical_prompt_post_images"][:, 0, 0, 0].tolist() == [5.0, 7.0]
+    assert item["physical_prompt_actions"][:, :, 0].tolist() == [[4.0, 0.0], [5.0, 6.0]]
+    assert item["physical_prompt_action_step_mask"].tolist() == [[True, False], [True, True]]
+
+
 def test_physical_prompt_dataset_supplies_an_explicit_wrong_task():
     dataset = _data_loader.PhysicalPromptDataset(
         _CounterfactualPromptDatasetFixture(),
@@ -146,6 +163,28 @@ def test_episode_block_sampler_preserves_blocks_and_changes_epoch_order():
     # The sampler never permutes frames within a block.  Short tail blocks can
     # appear at arbitrary positions, so verify the defining adjacency instead.
     assert all(epoch_a.index(value + 1) == epoch_a.index(value) + 1 for value in (0, 1, 3, 5, 6, 8))
+
+
+def test_balanced_episode_block_sampler_oversamples_pairs_and_excludes_heldout():
+    boundaries = {
+        "from": torch.tensor([0, 8, 16, 24]),
+        "to": torch.tensor([8, 16, 24, 32]),
+    }
+    sampler = _data_loader.BalancedEpisodeBlockSampler(
+        boundaries,
+        qualified_episodes=[True, False, False, False],
+        allowed_episodes=[True, True, True, False],
+        block_size=4,
+        seed=4,
+        qualified_fraction=0.5,
+    )
+
+    indices = list(sampler)
+
+    assert len(indices) == 24
+    assert sum(index < 8 for index in indices) == 12
+    assert all(index < 24 for index in indices)
+    assert all(indices[offset + 1] == indices[offset] + 1 for offset in range(0, len(indices), 4))
 
 
 def test_torch_data_loader():

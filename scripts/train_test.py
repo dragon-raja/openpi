@@ -26,6 +26,16 @@ def test_physical_prompt_rank_schedule_and_per_example_reduction():
     loss = jnp.arange(24, dtype=jnp.float32).reshape(2, 3, 4)
     assert jnp.array_equal(train._per_example_loss(loss), jnp.array([5.5, 17.5]))  # noqa: SLF001
 
+    binding_config = dataclasses.replace(
+        _config._CONFIGS_DICT["pi05_libero_causal_behavior_binding_lora"],  # noqa: SLF001
+        physical_prompt_behavior_bind_weight=0.3,
+        physical_prompt_behavior_bind_warmup_steps=5,
+        physical_prompt_behavior_bind_ramp_steps=10,
+    )
+    assert float(train._scheduled_behavior_bind_weight(binding_config, 4)) == 0.0  # noqa: SLF001
+    assert float(train._scheduled_behavior_bind_weight(binding_config, 10)) == pytest.approx(0.15)  # noqa: SLF001
+    assert float(train._scheduled_behavior_bind_weight(binding_config, 15)) == pytest.approx(0.3)  # noqa: SLF001
+
 
 def test_physical_prompt_interventions_only_change_the_prompt():
     observation = _model.Observation(
@@ -66,6 +76,24 @@ def test_physical_prompt_interventions_only_change_the_prompt():
         reversed_actions.physical_prompt_actions,
         observation.physical_prompt_actions[:, ::-1],
     )
+
+
+def test_multistep_intervention_reverses_actions_within_each_transition():
+    actions = jnp.arange(12, dtype=jnp.float32).reshape(1, 2, 3, 2)
+    action_mask = jnp.array([[[True, True, False], [True, True, True]]])
+    observation = _model.Observation(
+        images={"base_0_rgb": jnp.zeros((1, 1, 1, 1))},
+        image_masks={"base_0_rgb": jnp.ones(1, dtype=bool)},
+        state=jnp.zeros((1, 1)),
+        physical_prompt_actions=actions,
+        physical_prompt_action_mask=action_mask,
+    )
+
+    reversed_actions = train._intervene_physical_prompt(observation, reverse_actions=True)  # noqa: SLF001
+
+    expected = jnp.array([[[[2, 3], [0, 1], [4, 5]], [[10, 11], [8, 9], [6, 7]]]], dtype=jnp.float32)
+    assert jnp.array_equal(reversed_actions.physical_prompt_actions, expected)
+    assert jnp.array_equal(reversed_actions.physical_prompt_action_mask, action_mask)
 
 
 @pytest.mark.parametrize("config_name", ["debug"])

@@ -190,6 +190,11 @@ class DirectParquetLeRobotDataset(Dataset):
         )
         return table.to_pydict()
 
+    @functools.lru_cache(maxsize=128)  # noqa: B019 - cache lifetime intentionally matches the dataset
+    def _read_action_row_group(self, episode_index: int, row_group: int) -> dict[str, list]:
+        """Read action-only prompt rows without decoding unused embedded PNG columns."""
+        return self._parquet_file(episode_index).read_row_group(row_group, columns=["actions"]).to_pydict()
+
     def _row(self, episode_index: int, local_index: int) -> dict:
         offsets = self._row_group_offsets(episode_index)
         row_group = bisect.bisect_right(offsets, local_index)
@@ -225,6 +230,14 @@ class DirectParquetLeRobotDataset(Dataset):
             "image": self._decode_image(row["image"]),
             "actions": torch.tensor(row["actions"], dtype=torch.float32),
         }
+
+    def get_prompt_action(self, index: int) -> torch.Tensor:
+        episode_index, local_index = self._locate(index)
+        offsets = self._row_group_offsets(episode_index)
+        row_group = bisect.bisect_right(offsets, local_index)
+        group_start = 0 if row_group == 0 else offsets[row_group - 1]
+        data = self._read_action_row_group(episode_index, row_group)
+        return torch.tensor(data["actions"][local_index - group_start], dtype=torch.float32)
 
     def __getitem__(self, index: SupportsIndex) -> dict:
         global_index = index.__index__()
@@ -266,6 +279,7 @@ class PhysicalPromptDataset(Dataset):
         num_frames: int,
         seed: int = 0,
         include_effects: bool = False,
+        effect_horizons: Sequence[int] = (),
         include_counterfactuals: bool = False,
         hard_negatives_only: bool = False,
         language_anchor_fraction: float = 0.0,
@@ -276,10 +290,19 @@ class PhysicalPromptDataset(Dataset):
             raise ValueError("language_anchor_fraction must be in [0, 1]")
         if hard_negatives_only and not include_counterfactuals:
             raise ValueError("hard_negatives_only requires include_counterfactuals")
+        if effect_horizons and not include_effects:
+            raise ValueError("effect_horizons requires include_effects")
+        if any(horizon <= 0 for horizon in effect_horizons):
+            raise ValueError("effect_horizons must be positive")
         self._dataset = dataset
         self._num_frames = num_frames
         self._seed = seed
         self._include_effects = include_effects
+        self._effect_horizons = (
+            tuple(effect_horizons[frame % len(effect_horizons)] for frame in range(num_frames))
+            if effect_horizons
+            else ()
+        )
         self._include_counterfactuals = include_counterfactuals
         self._hard_negatives_only = hard_negatives_only
         self._language_anchor_fraction = language_anchor_fraction
@@ -297,7 +320,7 @@ class PhysicalPromptDataset(Dataset):
             task_to_episodes.setdefault(task_index, []).append(episode_index)
         self._task_to_episodes = task_to_episodes
         self._task_index_by_text = task_index_by_text
-        self._prompt_cache: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]] = {}
+        self._prompt_cache: dict[tuple[int, int], tuple] = {}
 
     def _load_prompt(self, task_index: int, demo_episode: int):
         cache_key = (task_index, demo_episode)
@@ -307,22 +330,52 @@ class PhysicalPromptDataset(Dataset):
         episode_start = int(self._dataset.episode_data_index["from"][demo_episode])
         episode_end = int(self._dataset.episode_data_index["to"][demo_episode])
         get_prompt_frame = getattr(self._dataset, "get_prompt_frame", self._dataset.__getitem__)
+        get_prompt_action = getattr(self._dataset, "get_prompt_action", None)
+
+        def aligned_action(index: int, item: dict | None = None) -> torch.Tensor:
+            action = (
+                get_prompt_action(index)
+                if get_prompt_action is not None
+                else (item or get_prompt_frame(index))["actions"]
+            )
+            if action.ndim > 1:
+                action = action[0]
+            return action
+
+        prompt_action_step_mask = None
         if self._include_effects:
-            if episode_end - episode_start < 2:
-                raise ValueError(f"Effect prompts require at least two frames; episode {demo_episode} is too short")
+            max_horizon = max(self._effect_horizons, default=1)
+            if episode_end - episode_start <= max_horizon:
+                raise ValueError(
+                    f"Effect prompts require more than {max_horizon} frames; episode {demo_episode} is too short"
+                )
             # Sparse anchors cover the episode, but every effect is a true
             # one-step transition: image_i, action_i, image_{i+1}. Pairing
             # adjacent *sparse samples* would incorrectly attribute all
             # intervening actions to action_i.
             demo_indices = np.linspace(
                 episode_start,
-                episode_end - 2,
+                episode_end - max_horizon - 1,
                 num=self._num_frames,
                 dtype=np.int64,
             )
             demo_items = [get_prompt_frame(int(demo_index)) for demo_index in demo_indices]
-            post_items = [get_prompt_frame(int(demo_index + 1)) for demo_index in demo_indices]
+            horizons = self._effect_horizons or (1,) * self._num_frames
+            post_items = [
+                get_prompt_frame(int(demo_index + horizon))
+                for demo_index, horizon in zip(demo_indices, horizons, strict=True)
+            ]
             prompt_post_images = torch.stack([item["image"] for item in post_items])
+            if self._effect_horizons:
+                action_sequences = []
+                action_masks = []
+                for demo_index, horizon in zip(demo_indices, horizons, strict=True):
+                    sequence = [aligned_action(int(demo_index + offset)) for offset in range(horizon)]
+                    padding = [torch.zeros_like(sequence[0]) for _ in range(max_horizon - horizon)]
+                    action_sequences.append(torch.stack([*sequence, *padding]))
+                    action_masks.append(torch.arange(max_horizon, dtype=torch.int64) < horizon)
+                prompt_actions = torch.stack(action_sequences)
+                prompt_action_step_mask = torch.stack(action_masks)
         else:
             demo_indices = np.linspace(
                 episode_start,
@@ -333,15 +386,14 @@ class PhysicalPromptDataset(Dataset):
             demo_items = [get_prompt_frame(int(demo_index)) for demo_index in demo_indices]
             prompt_post_images = None
         prompt_images = torch.stack([item["image"] for item in demo_items])
-        prompt_actions = []
-        for item in demo_items[: self._num_frames]:
-            action = item["actions"]
-            # With delta_timestamps, LeRobot returns the full target chunk.
-            # The prompt token represents the action aligned to this frame.
-            if action.ndim > 1:
-                action = action[0]
-            prompt_actions.append(action)
-        result = (prompt_images, torch.stack(prompt_actions), prompt_post_images)
+        if not self._effect_horizons:
+            prompt_actions = torch.stack(
+                [
+                    aligned_action(int(demo_index), item)
+                    for demo_index, item in zip(demo_indices, demo_items, strict=True)
+                ]
+            )
+        result = (prompt_images, prompt_actions, prompt_post_images, prompt_action_step_mask)
         self._prompt_cache[cache_key] = result
         return result
 
@@ -359,7 +411,9 @@ class PhysicalPromptDataset(Dataset):
         if demo_episode == query_episode and len(candidates) > 1:
             demo_episode = candidates[(choice + 1) % len(candidates)]
 
-        prompt_images, prompt_actions, prompt_post_images = self._load_prompt(task_index, demo_episode)
+        prompt_images, prompt_actions, prompt_post_images, prompt_action_step_mask = self._load_prompt(
+            task_index, demo_episode
+        )
 
         # A deterministic fraction of examples keeps the released
         # language-conditioned behavior alive while learning a new prompt
@@ -387,6 +441,8 @@ class PhysicalPromptDataset(Dataset):
             result["prompt"] = self._dataset.meta.tasks[task_index]
         if prompt_post_images is not None:
             result["physical_prompt_post_images"] = prompt_post_images
+        if prompt_action_step_mask is not None:
+            result["physical_prompt_action_step_mask"] = prompt_action_step_mask
         if self._include_counterfactuals:
             task_text = self._dataset.meta.tasks[task_index]
             counterfactual_text = _LIBERO_COUNTERFACTUAL_TASK_PAIRS.get(task_text)
@@ -405,9 +461,12 @@ class PhysicalPromptDataset(Dataset):
             counterfactual_candidates = self._task_to_episodes[counterfactual_task]
             counterfactual_choice = (self._seed + counterfactual_task * 1_000_003) % len(counterfactual_candidates)
             counterfactual_episode = counterfactual_candidates[counterfactual_choice]
-            counterfactual_images, counterfactual_actions, counterfactual_post_images = self._load_prompt(
-                counterfactual_task, counterfactual_episode
-            )
+            (
+                counterfactual_images,
+                counterfactual_actions,
+                counterfactual_post_images,
+                counterfactual_action_step_mask,
+            ) = self._load_prompt(counterfactual_task, counterfactual_episode)
             result.update(
                 {
                     "physical_prompt_counterfactual_images": counterfactual_images,
@@ -420,6 +479,8 @@ class PhysicalPromptDataset(Dataset):
             )
             if counterfactual_post_images is not None:
                 result["physical_prompt_counterfactual_post_images"] = counterfactual_post_images
+            if counterfactual_action_step_mask is not None:
+                result["physical_prompt_counterfactual_action_step_mask"] = counterfactual_action_step_mask
         return result
 
     def __len__(self) -> int:
@@ -454,10 +515,91 @@ class EpisodeBlockSampler(torch.utils.data.Sampler[int]):
         return int(np.sum(self._ends - self._starts))
 
 
+class BalancedEpisodeBlockSampler(torch.utils.data.Sampler[int]):
+    """Balance qualified task blocks while excluding held-out episodes.
+
+    Only full blocks are used so every epoch has a stable length even when a
+    smaller qualified pool must be sampled with replacement.
+    """
+
+    def __init__(
+        self,
+        episode_data_index: dict[str, torch.Tensor],
+        *,
+        qualified_episodes: Sequence[bool],
+        allowed_episodes: Sequence[bool],
+        block_size: int,
+        seed: int,
+        qualified_fraction: float | None,
+    ):
+        if block_size <= 0:
+            raise ValueError("block_size must be positive")
+        if qualified_fraction is not None and not 0.0 <= qualified_fraction <= 1.0:
+            raise ValueError("qualified_fraction must be in [0, 1]")
+        starts = np.asarray(episode_data_index["from"], dtype=np.int64)
+        ends = np.asarray(episode_data_index["to"], dtype=np.int64)
+        if len(qualified_episodes) != len(starts) or len(allowed_episodes) != len(starts):
+            raise ValueError("Episode masks must match episode boundaries")
+        qualified_blocks = []
+        other_blocks = []
+        for episode, (start, end) in enumerate(zip(starts, ends, strict=True)):
+            if not allowed_episodes[episode]:
+                continue
+            target = qualified_blocks if qualified_episodes[episode] else other_blocks
+            target.extend(
+                (block_start, block_start + block_size)
+                for block_start in range(int(start), int(end) - block_size + 1, block_size)
+            )
+        if not qualified_blocks and qualified_fraction:
+            raise ValueError("No qualified hard-pair blocks are available")
+        if not other_blocks and qualified_fraction != 1.0:
+            raise ValueError("No non-qualified blocks are available")
+        self._qualified_blocks = tuple(qualified_blocks)
+        self._other_blocks = tuple(other_blocks)
+        self._block_size = block_size
+        self._seed = seed
+        self._epoch = 0
+        self._qualified_fraction = qualified_fraction
+        self._num_blocks = len(qualified_blocks) + len(other_blocks)
+
+    @staticmethod
+    def _sample_blocks(rng, blocks, count):
+        if count == 0:
+            return []
+        choices = rng.choice(len(blocks), size=count, replace=count > len(blocks))
+        return [blocks[int(choice)] for choice in np.atleast_1d(choices)]
+
+    def __iter__(self):
+        rng = np.random.default_rng(self._seed + self._epoch)
+        self._epoch += 1
+        if self._qualified_fraction is None:
+            blocks = [*self._qualified_blocks, *self._other_blocks]
+        else:
+            qualified_count = round(self._num_blocks * self._qualified_fraction)
+            blocks = [
+                *self._sample_blocks(rng, self._qualified_blocks, qualified_count),
+                *self._sample_blocks(rng, self._other_blocks, self._num_blocks - qualified_count),
+            ]
+        rng.shuffle(blocks)
+        for start, end in blocks:
+            yield from range(start, end)
+
+    def __len__(self) -> int:
+        return self._num_blocks * self._block_size
+
+
 def _episode_data_index(dataset) -> dict[str, torch.Tensor] | None:
     while dataset is not None:
         if hasattr(dataset, "episode_data_index"):
             return dataset.episode_data_index
+        dataset = getattr(dataset, "_dataset", None)
+    return None
+
+
+def _dataset_metadata(dataset):
+    while dataset is not None:
+        if hasattr(dataset, "meta"):
+            return dataset.meta
         dataset = getattr(dataset, "_dataset", None)
     return None
 
@@ -568,6 +710,7 @@ def create_torch_dataset(
             num_frames=data_config.physical_prompt_frames,
             seed=data_config.physical_prompt_seed,
             include_effects=data_config.physical_prompt_effects,
+            effect_horizons=data_config.physical_prompt_effect_horizons,
             include_counterfactuals=data_config.physical_prompt_counterfactuals,
             hard_negatives_only=data_config.physical_prompt_hard_negatives_only,
             language_anchor_fraction=data_config.physical_prompt_language_anchor_fraction,
@@ -741,11 +884,38 @@ def create_torch_data_loader(
     if data_config.physical_prompt_frames and shuffle:
         if episode_data_index is None:
             raise ValueError("Physical-prompt block sampling requires episode boundaries")
-        sampler = EpisodeBlockSampler(
-            episode_data_index,
-            block_size=data_config.physical_prompt_block_size,
-            seed=seed,
-        )
+        if data_config.physical_prompt_hard_pair_fraction or data_config.physical_prompt_heldout_tasks:
+            metadata = _dataset_metadata(dataset)
+            if metadata is None:
+                raise ValueError("Task-balanced physical prompting requires dataset metadata")
+            heldout_tasks = set(data_config.physical_prompt_heldout_tasks)
+            missing_heldout = heldout_tasks - set(metadata.tasks.values())
+            if missing_heldout:
+                raise ValueError(f"Held-out physical-prompt tasks are absent from the dataset: {missing_heldout}")
+            episode_tasks = [metadata.episodes[index]["tasks"][0] for index in sorted(metadata.episodes)]
+            allowed_episodes = [task not in heldout_tasks for task in episode_tasks]
+            qualified_episodes = [
+                allowed and task in _LIBERO_COUNTERFACTUAL_TASK_PAIRS
+                for allowed, task in zip(allowed_episodes, episode_tasks, strict=True)
+            ]
+            sampler = BalancedEpisodeBlockSampler(
+                episode_data_index,
+                qualified_episodes=qualified_episodes,
+                allowed_episodes=allowed_episodes,
+                block_size=data_config.physical_prompt_block_size,
+                seed=seed,
+                qualified_fraction=(
+                    data_config.physical_prompt_hard_pair_fraction
+                    if data_config.physical_prompt_hard_pair_fraction
+                    else None
+                ),
+            )
+        else:
+            sampler = EpisodeBlockSampler(
+                episode_data_index,
+                block_size=data_config.physical_prompt_block_size,
+                seed=seed,
+            )
     if framework == "pytorch":
         if torch.distributed.is_initialized():
             sampler = torch.utils.data.distributed.DistributedSampler(

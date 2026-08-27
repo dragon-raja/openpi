@@ -42,10 +42,16 @@ class Pi0Config(_model.BaseModelConfig):
     # Encode action effects from explicit (pre-image, action, post-image)
     # transition units rather than independent frame-action pairs.
     physical_prompt_effects: bool = False
+    # Temporal scales k for exactly covered (o_t, a_t:t+k, o_t+k)
+    # transitions. Empty preserves the single-action C2 representation.
+    physical_prompt_effect_horizons: tuple[int, ...] = ()
     # Number of largest local post-minus-pre changes retained as separate
     # action-gated tokens per prompt frame. Zero preserves the C1 global
     # mean-effect fusion path.
     physical_prompt_local_effect_tokens: int = 0
+    # Width of the explicit behavior-binding bottleneck. Zero disables the C3
+    # behavior token and retrieval objective.
+    physical_prompt_behavior_latent_dim: int = 0
     # Carry an explicit wrong-task demonstration during training.  These
     # fields are ignored by inference and only materialized by the causal
     # ranking objective.
@@ -64,12 +70,22 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("physical_prompt_pool_grid must be a positive divisor of 16")
         if self.physical_prompt_effects and not self.physical_prompt_frames:
             raise ValueError("physical_prompt_effects requires physical_prompt_frames > 0")
+        if self.physical_prompt_effect_horizons and not self.physical_prompt_effects:
+            raise ValueError("physical_prompt_effect_horizons requires physical_prompt_effects")
+        if any(horizon <= 0 for horizon in self.physical_prompt_effect_horizons):
+            raise ValueError("physical_prompt_effect_horizons must be positive")
+        if self.physical_prompt_effect_horizons and max(self.physical_prompt_effect_horizons) > self.action_horizon:
+            raise ValueError("physical_prompt_effect_horizons cannot exceed action_horizon")
         if self.physical_prompt_local_effect_tokens < 0:
             raise ValueError("physical_prompt_local_effect_tokens must be non-negative")
         if self.physical_prompt_local_effect_tokens and not self.physical_prompt_effects:
             raise ValueError("physical_prompt_local_effect_tokens requires physical_prompt_effects")
         if self.physical_prompt_local_effect_tokens > self.physical_prompt_pool_grid**2:
             raise ValueError("physical_prompt_local_effect_tokens cannot exceed the pooled visual token count")
+        if self.physical_prompt_behavior_latent_dim < 0:
+            raise ValueError("physical_prompt_behavior_latent_dim must be non-negative")
+        if self.physical_prompt_behavior_latent_dim and not self.physical_prompt_effect_horizons:
+            raise ValueError("physical_prompt_behavior_latent_dim requires multi-step physical-prompt effects")
         if self.physical_prompt_counterfactuals and not self.physical_prompt_frames:
             raise ValueError("physical_prompt_counterfactuals requires physical_prompt_frames > 0")
         if self.pytorch_compile_mode is not None:
@@ -135,12 +151,31 @@ class Pi0Config(_model.BaseModelConfig):
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
                 physical_prompt_actions=(
-                    jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames, self.action_dim], jnp.float32)
+                    jax.ShapeDtypeStruct(
+                        (
+                            [
+                                batch_size,
+                                self.physical_prompt_frames,
+                                max(self.physical_prompt_effect_horizons),
+                                self.action_dim,
+                            ]
+                            if self.physical_prompt_effect_horizons
+                            else [batch_size, self.physical_prompt_frames, self.action_dim]
+                        ),
+                        jnp.float32,
+                    )
                     if self.physical_prompt_frames
                     else None
                 ),
                 physical_prompt_action_mask=(
-                    jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames], bool)
+                    jax.ShapeDtypeStruct(
+                        (
+                            [batch_size, self.physical_prompt_frames, max(self.physical_prompt_effect_horizons)]
+                            if self.physical_prompt_effect_horizons
+                            else [batch_size, self.physical_prompt_frames]
+                        ),
+                        bool,
+                    )
                     if self.physical_prompt_frames
                     else None
                 ),
@@ -181,12 +216,31 @@ class Pi0Config(_model.BaseModelConfig):
                     else None
                 ),
                 physical_prompt_counterfactual_actions=(
-                    jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames, self.action_dim], jnp.float32)
+                    jax.ShapeDtypeStruct(
+                        (
+                            [
+                                batch_size,
+                                self.physical_prompt_frames,
+                                max(self.physical_prompt_effect_horizons),
+                                self.action_dim,
+                            ]
+                            if self.physical_prompt_effect_horizons
+                            else [batch_size, self.physical_prompt_frames, self.action_dim]
+                        ),
+                        jnp.float32,
+                    )
                     if self.physical_prompt_counterfactuals
                     else None
                 ),
                 physical_prompt_counterfactual_action_mask=(
-                    jax.ShapeDtypeStruct([batch_size, self.physical_prompt_frames], bool)
+                    jax.ShapeDtypeStruct(
+                        (
+                            [batch_size, self.physical_prompt_frames, max(self.physical_prompt_effect_horizons)]
+                            if self.physical_prompt_effect_horizons
+                            else [batch_size, self.physical_prompt_frames]
+                        ),
+                        bool,
+                    )
                     if self.physical_prompt_counterfactuals
                     else None
                 ),

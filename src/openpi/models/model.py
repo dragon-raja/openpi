@@ -99,16 +99,16 @@ class Observation(Generic[ArrayT]):
     # Tokenized prompt mask.
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
-    # Optional actions aligned with sparse physical-prompt video frames.  The
-    # corresponding prompt images live in ``images`` under keys named
-    # ``physical_prompt_{frame:03d}_rgb``.  Keeping the actions separate lets
-    # us ablate or shuffle them without changing the visual prompt.
-    physical_prompt_actions: at.Float[ArrayT, "*b p a"] | None = None
-    physical_prompt_action_mask: at.Bool[ArrayT, "*b p"] | None = None
+    # Optional actions aligned with sparse physical-prompt video frames. C2
+    # uses one action per frame [*b, p, a], while C3 carries a padded action
+    # chunk per frame [*b, p, t, a]. Keeping the actions separate lets us
+    # ablate or shuffle them without changing the visual prompt.
+    physical_prompt_actions: at.Float[ArrayT, "*b p a"] | at.Float[ArrayT, "*b p t a"] | None = None
+    physical_prompt_action_mask: at.Bool[ArrayT, "*b p"] | at.Bool[ArrayT, "*b p t"] | None = None
     physical_prompt_counterfactual_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
     physical_prompt_counterfactual_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
-    physical_prompt_counterfactual_actions: at.Float[ArrayT, "*b p a"] | None = None
-    physical_prompt_counterfactual_action_mask: at.Bool[ArrayT, "*b p"] | None = None
+    physical_prompt_counterfactual_actions: at.Float[ArrayT, "*b p a"] | at.Float[ArrayT, "*b p t a"] | None = None
+    physical_prompt_counterfactual_action_mask: at.Bool[ArrayT, "*b p"] | at.Bool[ArrayT, "*b p t"] | None = None
     # Per-example training mask for causal ranking. False examples still
     # contribute behavior cloning but cannot supply a strict same-physics
     # negative (or are language behavior anchors).
@@ -127,7 +127,7 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
-        if ("physical_prompt_actions" in data) != ("physical_prompt_action_mask" in data):
+        if (data.get("physical_prompt_actions") is not None) != (data.get("physical_prompt_action_mask") is not None):
             raise ValueError("physical_prompt_actions and physical_prompt_action_mask must be provided together.")
         counterfactual_keys = (
             "physical_prompt_counterfactual_images",
@@ -135,11 +135,14 @@ class Observation(Generic[ArrayT]):
             "physical_prompt_counterfactual_actions",
             "physical_prompt_counterfactual_action_mask",
         )
-        if any(key in data for key in counterfactual_keys) and not all(key in data for key in counterfactual_keys):
+        counterfactual_values = [data.get(key) for key in counterfactual_keys]
+        if any(value is not None for value in counterfactual_values) and not all(
+            value is not None for value in counterfactual_values
+        ):
             raise ValueError("All physical-prompt counterfactual fields must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
         image_dicts = [data["image"]]
-        if "physical_prompt_counterfactual_images" in data:
+        if data.get("physical_prompt_counterfactual_images") is not None:
             image_dicts.append(data["physical_prompt_counterfactual_images"])
         for image_dict in image_dicts:
             for key in image_dict:

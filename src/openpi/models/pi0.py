@@ -16,6 +16,12 @@ from openpi.shared import array_typing as at
 logger = logging.getLogger("openpi")
 
 
+def _safe_l2_normalize(value, *, epsilon: float = 1e-6):
+    """Normalize without the undefined zero-vector gradient of ``linalg.norm``."""
+    squared_norm = jnp.sum(jnp.square(value), axis=-1, keepdims=True)
+    return value * jax.lax.rsqrt(squared_norm + epsilon)
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -70,7 +76,9 @@ class Pi0(_model.BaseModel):
         self.physical_prompt_frames = config.physical_prompt_frames
         self.physical_prompt_pool_grid = config.physical_prompt_pool_grid
         self.physical_prompt_effects = config.physical_prompt_effects
+        self.physical_prompt_effect_horizons = config.physical_prompt_effect_horizons
         self.physical_prompt_local_effect_tokens = config.physical_prompt_local_effect_tokens
+        self.physical_prompt_behavior_latent_dim = config.physical_prompt_behavior_latent_dim
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -123,6 +131,31 @@ class Pi0(_model.BaseModel):
                         )
                         * 0.02
                     )
+            if config.physical_prompt_effect_horizons:
+                max_effect_horizon = max(config.physical_prompt_effect_horizons)
+                temporal_width = paligemma_config.width // 8
+                self.physical_prompt_action_temporal_position_embedding = nnx.Param(
+                    jax.random.normal(rngs.params(), (max_effect_horizon, paligemma_config.width), dtype=jnp.float32)
+                    * 0.02
+                )
+                self.physical_prompt_query_action_position_embedding = nnx.Param(
+                    jax.random.normal(rngs.params(), (config.action_horizon, paligemma_config.width), dtype=jnp.float32)
+                    * 0.02
+                )
+                self.physical_prompt_action_temporal_down = nnx.Linear(
+                    paligemma_config.width, temporal_width, rngs=rngs
+                )
+                self.physical_prompt_action_temporal_up = nnx.Linear(temporal_width, paligemma_config.width, rngs=rngs)
+            if config.physical_prompt_behavior_latent_dim:
+                self.physical_prompt_behavior_down = nnx.Linear(
+                    paligemma_config.width, config.physical_prompt_behavior_latent_dim, rngs=rngs
+                )
+                self.physical_prompt_behavior_up = nnx.Linear(
+                    config.physical_prompt_behavior_latent_dim, paligemma_config.width, rngs=rngs
+                )
+                self.physical_prompt_behavior_token_embedding = nnx.Param(
+                    jax.random.normal(rngs.params(), (paligemma_config.width,), dtype=jnp.float32) * 0.02
+                )
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -134,6 +167,89 @@ class Pi0(_model.BaseModel):
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
+
+    def _pool_physical_prompt_image(self, obs: _model.Observation, name: str):
+        image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+        side = int(image_tokens.shape[1] ** 0.5)
+        if side * side != image_tokens.shape[1] or side % self.physical_prompt_pool_grid:
+            raise ValueError(
+                "Physical-prompt pooling requires a square vision token map divisible by "
+                f"{self.physical_prompt_pool_grid}; got {image_tokens.shape[1]} tokens"
+            )
+        pool = side // self.physical_prompt_pool_grid
+        return einops.reduce(
+            image_tokens,
+            "b (gh ph gw pw) d -> b (gh gw) d",
+            "mean",
+            gh=self.physical_prompt_pool_grid,
+            gw=self.physical_prompt_pool_grid,
+            ph=pool,
+            pw=pool,
+        )
+
+    def _encode_physical_prompt_action(self, actions, action_mask):
+        if actions.ndim == 2:
+            return self.physical_prompt_action_in_proj(actions), action_mask
+        if actions.ndim != 3 or action_mask.ndim != 2:
+            raise ValueError(
+                "Multi-step prompt actions and masks must have shapes [batch, horizon, action] and [batch, horizon]"
+            )
+        action_tokens = self.physical_prompt_action_in_proj(actions)
+        positions = self.physical_prompt_action_temporal_position_embedding.value[: actions.shape[1]]
+        temporal = jax.nn.gelu(self.physical_prompt_action_temporal_down(action_tokens + positions[None, :, :]))
+        temporal = self.physical_prompt_action_temporal_up(temporal)
+        mask = action_mask.astype(temporal.dtype)
+        denominator = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1.0)
+        action_token = jnp.sum(temporal * mask[..., None], axis=1) / denominator
+        return action_token, jnp.any(action_mask, axis=1)
+
+    def _pool_behavior_frames(self, frame_representations, frame_masks):
+        frames = jnp.stack(frame_representations, axis=1)
+        masks = jnp.stack(frame_masks, axis=1)
+        mask = masks.astype(frames.dtype)
+        denominator = jnp.maximum(jnp.sum(mask, axis=1, keepdims=True), 1.0)
+        pooled = jnp.sum(frames * mask[..., None], axis=1) / denominator
+        latent = self.physical_prompt_behavior_down(pooled)
+        return _safe_l2_normalize(latent)
+
+    def encode_physical_prompt_behavior(self, obs: _model.Observation):
+        """Encode a normalized behavior latent for the C3 binding objective."""
+        if not self.physical_prompt_behavior_latent_dim:
+            raise ValueError("Physical-prompt behavior binding is disabled")
+        prompt_names = sorted(
+            name
+            for name in obs.images
+            if name.startswith("physical_prompt_") and not name.startswith("physical_prompt_post_")
+        )
+        prompt_post_names = sorted(name for name in obs.images if name.startswith("physical_prompt_post_"))
+        frame_representations = []
+        frame_masks = []
+        for frame, name in enumerate(prompt_names):
+            pre_tokens = self._pool_physical_prompt_image(obs, name)
+            post_name = prompt_post_names[frame]
+            post_tokens = self._pool_physical_prompt_image(obs, post_name)
+            action_token, action_valid = self._encode_physical_prompt_action(
+                obs.physical_prompt_actions[:, frame], obs.physical_prompt_action_mask[:, frame]
+            )
+            effect_mask = jnp.logical_and(action_valid, obs.image_masks[name])
+            effect_mask = jnp.logical_and(effect_mask, obs.image_masks[post_name])
+            effect_summary = jnp.mean(post_tokens - pre_tokens, axis=1)
+            visual_summary = jnp.mean(pre_tokens, axis=1)
+            frame_representations.append(action_token + visual_summary + effect_summary)
+            frame_masks.append(effect_mask)
+        return self._pool_behavior_frames(frame_representations, frame_masks)
+
+    def encode_query_action_behavior(self, actions: _model.Actions):
+        """Encode the supervised query action chunk in the same behavior space."""
+        if not self.physical_prompt_behavior_latent_dim:
+            raise ValueError("Physical-prompt behavior binding is disabled")
+        action_tokens = self.physical_prompt_action_in_proj(actions)
+        positions = self.physical_prompt_query_action_position_embedding.value[: actions.shape[1]]
+        temporal = jax.nn.gelu(self.physical_prompt_action_temporal_down(action_tokens + positions[None, :, :]))
+        temporal = self.physical_prompt_action_temporal_up(temporal)
+        pooled = jnp.mean(temporal, axis=1)
+        latent = self.physical_prompt_behavior_down(pooled)
+        return _safe_l2_normalize(latent)
 
     @at.typecheck
     def embed_prefix(
@@ -177,27 +293,11 @@ class Pi0(_model.BaseModel):
             input_mask.append(prompt_valid[:, None])
             ar_mask += [False]
 
-            def pool_prompt_image(name: str):
-                image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
-                side = int(image_tokens.shape[1] ** 0.5)
-                if side * side != image_tokens.shape[1] or side % self.physical_prompt_pool_grid:
-                    raise ValueError(
-                        "Physical-prompt pooling requires a square vision token map divisible by "
-                        f"{self.physical_prompt_pool_grid}; got {image_tokens.shape[1]} tokens"
-                    )
-                pool = side // self.physical_prompt_pool_grid
-                return einops.reduce(
-                    image_tokens,
-                    "b (gh ph gw pw) d -> b (gh gw) d",
-                    "mean",
-                    gh=self.physical_prompt_pool_grid,
-                    gw=self.physical_prompt_pool_grid,
-                    ph=pool,
-                    pw=pool,
-                )
+            behavior_frames = []
+            behavior_masks = []
 
             for frame, name in enumerate(prompt_names):
-                pre_tokens = pool_prompt_image(name)
+                pre_tokens = self._pool_physical_prompt_image(obs, name)
                 position = self.physical_prompt_position_embedding.value[frame]
                 image_tokens = pre_tokens + position[None, None, :]
                 tokens.append(image_tokens)
@@ -210,12 +310,14 @@ class Pi0(_model.BaseModel):
                 )
                 ar_mask += [False] * image_tokens.shape[1]
 
-                action_token = self.physical_prompt_action_in_proj(obs.physical_prompt_actions[:, frame])
-                effect_mask = jnp.logical_and(obs.physical_prompt_action_mask[:, frame], obs.image_masks[name])
+                action_token, action_valid = self._encode_physical_prompt_action(
+                    obs.physical_prompt_actions[:, frame], obs.physical_prompt_action_mask[:, frame]
+                )
+                effect_mask = jnp.logical_and(action_valid, obs.image_masks[name])
                 local_effect_tokens = None
                 if self.physical_prompt_effects:
                     post_name = prompt_post_names[frame]
-                    post_tokens = pool_prompt_image(post_name)
+                    post_tokens = self._pool_physical_prompt_image(obs, post_name)
                     action_gate = jax.nn.sigmoid(self.physical_prompt_effect_gate(action_token))
                     effect_mask = jnp.logical_and(effect_mask, obs.image_masks[post_name])
                     patch_effects = post_tokens - pre_tokens
@@ -242,6 +344,11 @@ class Pi0(_model.BaseModel):
                         effect_delta = jnp.mean(patch_effects, axis=1)
                         effect_latent = jax.nn.gelu(self.physical_prompt_effect_down(effect_delta))
                         action_token = action_token + self.physical_prompt_effect_up(effect_latent * action_gate)
+                    if self.physical_prompt_behavior_latent_dim:
+                        behavior_frames.append(
+                            action_token + jnp.mean(pre_tokens, axis=1) + jnp.mean(patch_effects, axis=1)
+                        )
+                        behavior_masks.append(effect_mask)
                 action_token = action_token[:, None, :] + position[None, None, :]
                 tokens.append(action_token)
                 input_mask.append(effect_mask[:, None])
@@ -257,6 +364,14 @@ class Pi0(_model.BaseModel):
                         )
                     )
                     ar_mask += [False] * self.physical_prompt_local_effect_tokens
+
+            if self.physical_prompt_behavior_latent_dim:
+                behavior_latent = self._pool_behavior_frames(behavior_frames, behavior_masks)
+                behavior_token = self.physical_prompt_behavior_up(behavior_latent)
+                behavior_token += self.physical_prompt_behavior_token_embedding.value[None, :]
+                tokens.append(behavior_token[:, None, :])
+                input_mask.append(prompt_valid[:, None])
+                ar_mask += [False]
 
             tokens.append(
                 jnp.broadcast_to(

@@ -1,7 +1,9 @@
 import flax.nnx as nnx
 import jax
+import jax.numpy as jnp
 import pytest
 
+import openpi.models.pi0 as _pi0
 import openpi.models.pi0_config as _pi0_config
 
 
@@ -58,3 +60,36 @@ def test_local_effect_tokens_require_effect_prompts():
         physical_prompt_local_effect_tokens=4,
     )
     assert config.physical_prompt_local_effect_tokens == 4
+
+
+def test_behavior_binding_requires_exact_multistep_effects():
+    with pytest.raises(ValueError, match="requires multi-step"):
+        _pi0_config.Pi0Config(
+            physical_prompt_frames=8,
+            physical_prompt_effects=True,
+            physical_prompt_behavior_latent_dim=128,
+        )
+
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_horizon=10,
+        physical_prompt_frames=8,
+        physical_prompt_effects=True,
+        physical_prompt_effect_horizons=(1, 2, 4, 8),
+        physical_prompt_behavior_latent_dim=128,
+        physical_prompt_counterfactuals=True,
+    )
+    observation, _ = config.inputs_spec(batch_size=2)
+
+    assert observation.physical_prompt_actions.shape == (2, 8, 8, config.action_dim)
+    assert observation.physical_prompt_action_mask.shape == (2, 8, 8)
+    assert observation.physical_prompt_counterfactual_actions.shape == (2, 8, 8, config.action_dim)
+
+
+def test_safe_l2_normalize_has_finite_zero_vector_gradient():
+    value = jnp.zeros((2, 256), dtype=jnp.float32)
+    normalized = _pi0._safe_l2_normalize(value)  # noqa: SLF001
+    gradient = jax.grad(lambda x: jnp.sum(_pi0._safe_l2_normalize(x)))(value)  # noqa: SLF001
+
+    assert jnp.array_equal(normalized, value)
+    assert jnp.all(jnp.isfinite(gradient))

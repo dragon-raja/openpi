@@ -40,6 +40,7 @@ class LiberoInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
     physical_prompt_frames: int = 0
     physical_prompt_effects: bool = False
+    physical_prompt_action_horizon: int = 1
     physical_prompt_counterfactuals: bool = False
 
     def __call__(self, data: dict) -> dict:
@@ -60,6 +61,7 @@ class LiberoInputs(transforms.DataTransformFn):
         if self.physical_prompt_frames:
             raw_prompt_images = data.get("physical_prompt/images")
             raw_prompt_actions = data.get("physical_prompt/actions")
+            raw_prompt_action_mask = data.get("physical_prompt/action_mask")
             raw_prompt_mask = data.get("physical_prompt/mask")
             raw_prompt_post_images = data.get("physical_prompt/post_images")
 
@@ -102,8 +104,16 @@ class LiberoInputs(transforms.DataTransformFn):
                     image_masks[key] = prompt_post_mask[frame]
 
             if raw_prompt_actions is None:
-                prompt_actions = np.zeros((self.physical_prompt_frames, 7), dtype=np.float32)
-                prompt_action_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
+                if self.physical_prompt_action_horizon > 1:
+                    prompt_actions = np.zeros(
+                        (self.physical_prompt_frames, self.physical_prompt_action_horizon, 7), dtype=np.float32
+                    )
+                    prompt_action_mask = np.zeros(
+                        (self.physical_prompt_frames, self.physical_prompt_action_horizon), dtype=bool
+                    )
+                else:
+                    prompt_actions = np.zeros((self.physical_prompt_frames, 7), dtype=np.float32)
+                    prompt_action_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
             else:
                 prompt_actions = np.asarray(raw_prompt_actions, dtype=np.float32)
                 if prompt_actions.shape[0] != self.physical_prompt_frames:
@@ -111,12 +121,31 @@ class LiberoInputs(transforms.DataTransformFn):
                         f"Expected {self.physical_prompt_frames} physical-prompt actions, "
                         f"got {prompt_actions.shape[0]}"
                     )
-                prompt_action_mask = prompt_mask.copy()
+                if prompt_actions.ndim == 3:
+                    if prompt_actions.shape[1] != self.physical_prompt_action_horizon:
+                        raise ValueError(
+                            f"Expected physical-prompt action horizon {self.physical_prompt_action_horizon}, "
+                            f"got {prompt_actions.shape[1]}"
+                        )
+                    if raw_prompt_action_mask is None:
+                        raise ValueError("Multi-step physical-prompt actions require an explicit action mask")
+                    prompt_action_mask = np.asarray(raw_prompt_action_mask, dtype=bool)
+                    if prompt_action_mask.shape != prompt_actions.shape[:2]:
+                        raise ValueError(
+                            "Physical-prompt action mask must match the frame and horizon axes: "
+                            f"{prompt_action_mask.shape} != {prompt_actions.shape[:2]}"
+                        )
+                    prompt_action_mask = np.logical_and(prompt_action_mask, prompt_mask[:, None])
+                elif prompt_actions.ndim == 2:
+                    prompt_action_mask = prompt_mask.copy()
+                else:
+                    raise ValueError(f"Expected rank-2 or rank-3 physical-prompt actions, got {prompt_actions.shape}")
 
             if self.physical_prompt_counterfactuals:
                 raw_counterfactual_images = data.get("physical_prompt/counterfactual_images")
                 raw_counterfactual_post_images = data.get("physical_prompt/counterfactual_post_images")
                 raw_counterfactual_actions = data.get("physical_prompt/counterfactual_actions")
+                raw_counterfactual_action_mask = data.get("physical_prompt/counterfactual_action_mask")
                 raw_counterfactual_mask = data.get("physical_prompt/counterfactual_mask")
                 if raw_counterfactual_images is None:
                     counterfactual_images = np.zeros_like(prompt_images)
@@ -167,8 +196,8 @@ class LiberoInputs(transforms.DataTransformFn):
                         }
                     )
                 if raw_counterfactual_actions is None:
-                    counterfactual_actions = np.zeros((self.physical_prompt_frames, 7), dtype=np.float32)
-                    counterfactual_action_mask = np.zeros(self.physical_prompt_frames, dtype=bool)
+                    counterfactual_actions = np.zeros_like(prompt_actions)
+                    counterfactual_action_mask = np.zeros_like(prompt_action_mask)
                 else:
                     counterfactual_actions = np.asarray(raw_counterfactual_actions, dtype=np.float32)
                     if counterfactual_actions.shape[0] != self.physical_prompt_frames:
@@ -176,7 +205,24 @@ class LiberoInputs(transforms.DataTransformFn):
                             f"Expected {self.physical_prompt_frames} counterfactual-prompt actions, "
                             f"got {counterfactual_actions.shape[0]}"
                         )
-                    counterfactual_action_mask = counterfactual_mask.copy()
+                    if counterfactual_actions.ndim == 3:
+                        if raw_counterfactual_action_mask is None:
+                            raise ValueError("Multi-step counterfactual actions require an explicit action mask")
+                        counterfactual_action_mask = np.asarray(raw_counterfactual_action_mask, dtype=bool)
+                        if counterfactual_action_mask.shape != counterfactual_actions.shape[:2]:
+                            raise ValueError(
+                                "Counterfactual action mask must match the frame and horizon axes: "
+                                f"{counterfactual_action_mask.shape} != {counterfactual_actions.shape[:2]}"
+                            )
+                        counterfactual_action_mask = np.logical_and(
+                            counterfactual_action_mask, counterfactual_mask[:, None]
+                        )
+                    elif counterfactual_actions.ndim == 2:
+                        counterfactual_action_mask = counterfactual_mask.copy()
+                    else:
+                        raise ValueError(
+                            f"Expected rank-2 or rank-3 counterfactual actions, got {counterfactual_actions.shape}"
+                        )
 
         # Create inputs dict. Prompt frames deliberately precede the live
         # cameras in insertion order; the model also checks their key prefix.

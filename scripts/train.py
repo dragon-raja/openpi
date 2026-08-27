@@ -109,8 +109,25 @@ def _intervene_physical_prompt(
         prompt_actions = observation.physical_prompt_counterfactual_actions
         prompt_action_mask = observation.physical_prompt_counterfactual_action_mask
     if reverse_actions:
-        prompt_actions = prompt_actions[:, ::-1]
-        prompt_action_mask = prompt_action_mask[:, ::-1]
+        if prompt_actions.ndim == 4:
+            # C3 reverses the action sequence *within* every exactly aligned
+            # transition while leaving pre/post images and sparse anchors
+            # fixed. Only the valid prefix is reversed; moving short sequences
+            # into the padded tail would expose a trivial mask-position cue.
+            horizon = prompt_actions.shape[2]
+            positions = jnp.arange(horizon)
+            valid_lengths = jnp.sum(prompt_action_mask, axis=2, dtype=jnp.int32)
+            source_positions = jnp.where(
+                positions[None, None, :] < valid_lengths[..., None],
+                valid_lengths[..., None] - 1 - positions[None, None, :],
+                positions[None, None, :],
+            )
+            prompt_actions = jnp.take_along_axis(prompt_actions, source_positions[..., None], axis=2)
+        else:
+            # C2 actions are rank-3 and retain their legacy frame-order
+            # intervention for reproducibility.
+            prompt_actions = prompt_actions[:, ::-1]
+            prompt_action_mask = prompt_action_mask[:, ::-1]
 
     return dataclasses.replace(
         observation,
@@ -130,6 +147,20 @@ def _scheduled_rank_weight(config: _config.TrainConfig, step: at.ArrayLike, maxi
     else:
         progress = jnp.asarray(step >= warmup, dtype=jnp.float32)
     return jnp.asarray(maximum, dtype=jnp.float32) * progress
+
+
+def _scheduled_behavior_bind_weight(config: _config.TrainConfig, step: at.ArrayLike) -> at.Array:
+    step = jnp.asarray(step, dtype=jnp.float32)
+    warmup = float(config.physical_prompt_behavior_bind_warmup_steps)
+    if config.physical_prompt_behavior_bind_ramp_steps:
+        progress = jnp.clip(
+            (step - warmup) / config.physical_prompt_behavior_bind_ramp_steps,
+            0.0,
+            1.0,
+        )
+    else:
+        progress = jnp.asarray(step >= warmup, dtype=jnp.float32)
+    return jnp.asarray(config.physical_prompt_behavior_bind_weight, dtype=jnp.float32) * progress
 
 
 def _per_example_loss(loss: at.Array) -> at.Array:
@@ -225,6 +256,63 @@ def train_step(
     rank_mask_float = rank_mask.astype(jnp.float32)
     rank_count = jnp.sum(rank_mask_float)
     safe_rank_count = jnp.maximum(rank_count, 1.0)
+
+    if config.physical_prompt_behavior_bind_weight:
+        wrong_observation = _intervene_physical_prompt(observation, use_counterfactual=True)
+        reversed_observation = _intervene_physical_prompt(observation, reverse_actions=True)
+
+        def behavior_binding_loss_fn(model, observation, wrong_observation, reversed_observation, actions):
+            query_latent = model.encode_query_action_behavior(actions)
+            positive_latent = model.encode_physical_prompt_behavior(observation)
+            wrong_latent = model.encode_physical_prompt_behavior(wrong_observation)
+            reversed_latent = model.encode_physical_prompt_behavior(reversed_observation)
+            positive_similarity = jnp.sum(query_latent * positive_latent, axis=-1)
+            wrong_similarity = jnp.sum(query_latent * wrong_latent, axis=-1)
+            reversed_similarity = jnp.sum(query_latent * reversed_latent, axis=-1)
+            logits = (
+                jnp.stack(
+                    [positive_similarity, wrong_similarity, reversed_similarity],
+                    axis=-1,
+                )
+                / config.physical_prompt_behavior_bind_temperature
+            )
+            per_example = -jax.nn.log_softmax(logits, axis=-1)[:, 0]
+            binding_loss = jnp.sum(per_example * rank_mask_float) / safe_rank_count
+            retrieval_correct = jnp.logical_and(
+                positive_similarity > wrong_similarity,
+                positive_similarity > reversed_similarity,
+            )
+            accuracy = jnp.sum(retrieval_correct.astype(jnp.float32) * rank_mask_float) / safe_rank_count
+            wrong_gap = jnp.sum((positive_similarity - wrong_similarity) * rank_mask_float) / safe_rank_count
+            reversed_gap = jnp.sum((positive_similarity - reversed_similarity) * rank_mask_float) / safe_rank_count
+            return binding_loss, (accuracy, wrong_gap, reversed_gap, positive_similarity)
+
+        (
+            (
+                binding_loss,
+                (binding_accuracy, binding_wrong_gap, binding_reversed_gap, positive_similarity),
+            ),
+            binding_grads,
+        ) = nnx.value_and_grad(
+            behavior_binding_loss_fn,
+            argnums=diff_state,
+            has_aux=True,
+        )(model, observation, wrong_observation, reversed_observation, actions)
+        binding_weight = _scheduled_behavior_bind_weight(config, state.step)
+        grads = jax.tree.map(lambda base, binding: base + binding_weight * binding, grads, binding_grads)
+        loss = loss + binding_weight * binding_loss
+        valid_positive_similarity = jnp.sum(positive_similarity * rank_mask_float) / safe_rank_count
+        rank_info.update(
+            {
+                "behavior_bind_loss": binding_loss,
+                "behavior_bind_weight": binding_weight,
+                "behavior_bind_grad_norm": optax.global_norm(binding_grads),
+                "behavior_bind_accuracy": binding_accuracy,
+                "behavior_bind_wrong_gap": binding_wrong_gap,
+                "behavior_bind_reversed_gap": binding_reversed_gap,
+                "behavior_bind_positive_similarity": valid_positive_similarity,
+            }
+        )
 
     def add_ranking_gradient(intervened_observation, *, maximum_weight: float, name: str):
         nonlocal grads, loss

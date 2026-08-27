@@ -29,6 +29,19 @@ NEUTRAL_PROMPT = "Follow the demonstrated behavior."
 STATE_ATOL = 1e-12
 
 
+def _reverse_valid_action_steps(actions: np.ndarray, action_mask: np.ndarray) -> np.ndarray:
+    """Reverse each valid action prefix without moving it into padded positions."""
+    horizon = actions.shape[1]
+    positions = np.arange(horizon)
+    valid_lengths = np.sum(action_mask, axis=1, dtype=np.int64)
+    source_positions = np.where(
+        positions[None, :] < valid_lengths[:, None],
+        valid_lengths[:, None] - 1 - positions[None, :],
+        positions[None, :],
+    )
+    return np.take_along_axis(actions, source_positions[..., None], axis=1)
+
+
 @dataclasses.dataclass(frozen=True)
 class PairSpec:
     pair_id: str
@@ -44,6 +57,7 @@ class PhysicalPrompt:
     images: np.ndarray
     actions: np.ndarray
     mask: np.ndarray
+    action_mask: np.ndarray | None = None
     post_images: np.ndarray | None = None
 
     def metadata(self, *, action_order: str) -> dict:
@@ -57,6 +71,8 @@ class PhysicalPrompt:
         }
         if self.post_images is not None:
             metadata["post_image_sha256"] = _sha256(self.post_images)
+        if self.action_mask is not None:
+            metadata["action_mask_sha256"] = _sha256(self.action_mask)
         return metadata
 
 
@@ -309,7 +325,12 @@ def _policy_observation(
     if physical_prompt is not None:
         prompt_actions = physical_prompt.actions
         if action_order == "reversed":
-            prompt_actions = prompt_actions[::-1].copy()
+            if prompt_actions.ndim == 3:
+                if physical_prompt.action_mask is None:
+                    raise ValueError("Multi-step reversed actions require an action mask")
+                prompt_actions = _reverse_valid_action_steps(prompt_actions, physical_prompt.action_mask)
+            else:
+                prompt_actions = prompt_actions[::-1].copy()
         elif action_order != "aligned":
             raise ValueError(f"Unknown physical-prompt action order: {action_order}")
         element.update(
@@ -319,6 +340,8 @@ def _policy_observation(
                 "physical_prompt/mask": physical_prompt.mask,
             }
         )
+        if physical_prompt.action_mask is not None:
+            element["physical_prompt/action_mask"] = physical_prompt.action_mask
         if physical_prompt.post_images is not None:
             element["physical_prompt/post_images"] = physical_prompt.post_images
     return element, image
@@ -332,6 +355,7 @@ def _load_physical_prompts(
     seed: int,
     action_horizon: int,
     include_effects: bool = False,
+    effect_horizons: tuple[int, ...] = (),
 ) -> dict[str, PhysicalPrompt]:
     """Load one deterministic other-episode demonstration for each task."""
     from lerobot.common.datasets.lerobot_dataset import LeRobotDatasetMetadata
@@ -351,6 +375,7 @@ def _load_physical_prompts(
         num_frames=num_frames,
         seed=seed,
         include_effects=include_effects,
+        effect_horizons=effect_horizons,
     )
     prompt_by_task: dict[str, PhysicalPrompt] = {}
     for task in sorted(tasks):
@@ -367,12 +392,16 @@ def _load_physical_prompts(
             prompt_post_images = np.asarray(prompt_post_images)
             prompt_post_images = np.transpose(prompt_post_images, (0, 2, 3, 1))
             prompt_post_images = np.rint(prompt_post_images * 255).clip(0, 255).astype(np.uint8)
+        prompt_action_mask = item.get("physical_prompt_action_step_mask")
+        if prompt_action_mask is not None:
+            prompt_action_mask = np.asarray(prompt_action_mask, dtype=bool)
         prompt_by_task[task] = PhysicalPrompt(
             task=task,
             demo_episode_index=int(item["physical_prompt_episode_index"]),
             images=prompt_images,
             actions=np.asarray(item["physical_prompt_actions"], dtype=np.float32),
             mask=np.asarray(item["physical_prompt_mask"], dtype=bool),
+            action_mask=prompt_action_mask,
             post_images=prompt_post_images,
         )
     return prompt_by_task
@@ -502,6 +531,7 @@ def evaluate_pairs(args, task_suites: dict, task_lookups: dict, pair_specs: tupl
             seed=args.physical_prompt_seed,
             action_horizon=args.action_horizon,
             include_effects=args.physical_prompt_effects,
+            effect_horizons=args.physical_prompt_effect_horizons,
         )
 
     for spec in pair_specs:
@@ -650,6 +680,7 @@ def main() -> None:
     )
     parser.add_argument("--physical-prompt-frames", type=int, default=8)
     parser.add_argument("--physical-prompt-seed", type=int, default=42)
+    parser.add_argument("--physical-prompt-effect-horizons", type=_parse_int_csv, default=())
     parser.add_argument(
         "--physical-prompt-effects",
         action="store_true",
