@@ -306,16 +306,33 @@ class PhysicalPromptDataset(Dataset):
 
         episode_start = int(self._dataset.episode_data_index["from"][demo_episode])
         episode_end = int(self._dataset.episode_data_index["to"][demo_episode])
-        demo_indices = np.linspace(
-            episode_start,
-            episode_end - 1,
-            num=self._num_frames + int(self._include_effects),
-            dtype=np.int64,
-        )
         get_prompt_frame = getattr(self._dataset, "get_prompt_frame", self._dataset.__getitem__)
-        demo_items = [get_prompt_frame(int(demo_index)) for demo_index in demo_indices]
-        prompt_images = torch.stack([item["image"] for item in demo_items[: self._num_frames]])
-        prompt_post_images = torch.stack([item["image"] for item in demo_items[1:]]) if self._include_effects else None
+        if self._include_effects:
+            if episode_end - episode_start < 2:
+                raise ValueError(f"Effect prompts require at least two frames; episode {demo_episode} is too short")
+            # Sparse anchors cover the episode, but every effect is a true
+            # one-step transition: image_i, action_i, image_{i+1}. Pairing
+            # adjacent *sparse samples* would incorrectly attribute all
+            # intervening actions to action_i.
+            demo_indices = np.linspace(
+                episode_start,
+                episode_end - 2,
+                num=self._num_frames,
+                dtype=np.int64,
+            )
+            demo_items = [get_prompt_frame(int(demo_index)) for demo_index in demo_indices]
+            post_items = [get_prompt_frame(int(demo_index + 1)) for demo_index in demo_indices]
+            prompt_post_images = torch.stack([item["image"] for item in post_items])
+        else:
+            demo_indices = np.linspace(
+                episode_start,
+                episode_end - 1,
+                num=self._num_frames,
+                dtype=np.int64,
+            )
+            demo_items = [get_prompt_frame(int(demo_index)) for demo_index in demo_indices]
+            prompt_post_images = None
+        prompt_images = torch.stack([item["image"] for item in demo_items])
         prompt_actions = []
         for item in demo_items[: self._num_frames]:
             action = item["actions"]

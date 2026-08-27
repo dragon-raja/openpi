@@ -78,6 +78,14 @@ Pi0.5 checkpoint rather than inheriting the failed C1 weights. Four action-gated
 strongest pooled `post-image - pre-image` patches per frame; C1's global mean-effect fusion remains available when
 `physical_prompt_local_effect_tokens=0`.
 
+Effect prompts use sparse pre-frame anchors distributed over the episode, but every post frame is exactly the next
+environment frame. Thus each transition is `(image_i, action_i, image_{i+1})`; adjacent sparse anchors must never be
+treated as an action effect because they contain unobserved intermediate actions.
+
+The config `pi05_libero_causal_icl_aligned_effect_lora` is the C2.1 control: it is hyperparameter-identical to C2 but
+has a separate experiment namespace so results from the corrected transition construction cannot overwrite the
+original sparse-interval run.
+
 The first 150 steps are behavior cloning only. A deterministic 25% of samples use the original task language with all
 physical-prompt tokens masked, anchoring the released language-conditioned behavior. From step 150 to 299, wrong-task
 and reversed-action rankings ramp linearly from zero to 0.15. Ranking is computed per example, normalized by the

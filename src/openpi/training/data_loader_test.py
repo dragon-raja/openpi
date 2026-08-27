@@ -85,13 +85,13 @@ def test_physical_prompt_dataset_uses_other_episode_and_is_deterministic():
 
 
 def test_physical_prompt_dataset_builds_action_effect_transitions():
-    dataset = _data_loader.PhysicalPromptDataset(_PromptDatasetFixture(), num_frames=3, seed=7, include_effects=True)
+    dataset = _data_loader.PhysicalPromptDataset(_PromptDatasetFixture(), num_frames=2, seed=7, include_effects=True)
 
     item = dataset[0]
 
-    assert item["physical_prompt_images"][:, 0, 0, 0].tolist() == [4.0, 5.0, 6.0]
-    assert item["physical_prompt_post_images"][:, 0, 0, 0].tolist() == [5.0, 6.0, 7.0]
-    assert item["physical_prompt_actions"][:, 0].tolist() == [4.0, 5.0, 6.0]
+    assert item["physical_prompt_images"][:, 0, 0, 0].tolist() == [4.0, 6.0]
+    assert item["physical_prompt_post_images"][:, 0, 0, 0].tolist() == [5.0, 7.0]
+    assert item["physical_prompt_actions"][:, 0].tolist() == [4.0, 6.0]
 
 
 def test_physical_prompt_dataset_supplies_an_explicit_wrong_task():
