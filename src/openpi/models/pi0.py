@@ -41,6 +41,19 @@ def _masked_logmeanexp_similarity(query, candidates, candidate_mask, *, temperat
     return jnp.where(jnp.any(mask, axis=-1), scores, 0.0)
 
 
+def _masked_routed_similarity(query, candidates, candidate_mask, route_query, route_keys, *, temperature: float):
+    """Route with state-only keys, then score behavior without candidate-dependent selection."""
+    mask = candidate_mask.astype(bool)
+    route_logits = jnp.einsum("bd,bpd->bp", route_query, route_keys) / temperature
+    route_logits = jnp.where(mask, route_logits, -1.0e4)
+    route_weights = jax.nn.softmax(route_logits, axis=-1)
+    route_weights = jnp.where(mask, route_weights, 0.0)
+    route_weights /= jnp.maximum(jnp.sum(route_weights, axis=-1, keepdims=True), 1.0e-6)
+    behavior_similarity = jnp.einsum("bd,bpd->bp", query, candidates)
+    scores = jnp.sum(route_weights * behavior_similarity, axis=-1)
+    return jnp.where(jnp.any(mask, axis=-1), scores, 0.0), route_weights
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -102,6 +115,7 @@ class Pi0(_model.BaseModel):
         self.physical_prompt_cross_modal_behavior_binding = config.physical_prompt_cross_modal_behavior_binding
         self.physical_prompt_query_context_binding = config.physical_prompt_query_context_binding
         self.physical_prompt_stage_alignment = config.physical_prompt_stage_alignment
+        self.physical_prompt_visual_stage_routing = config.physical_prompt_visual_stage_routing
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -187,6 +201,10 @@ class Pi0(_model.BaseModel):
                 if config.physical_prompt_query_context_binding:
                     self.physical_prompt_query_state_proj = nnx.Linear(
                         config.action_dim, paligemma_config.width, rngs=rngs
+                    )
+                if config.physical_prompt_visual_stage_routing:
+                    self.physical_prompt_stage_route_down = nnx.Linear(
+                        paligemma_config.width, config.physical_prompt_behavior_latent_dim, rngs=rngs
                     )
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -275,7 +293,9 @@ class Pi0(_model.BaseModel):
         if len(prompt_names) != self.physical_prompt_frames or len(prompt_post_names) != self.physical_prompt_frames:
             raise ValueError("Behavior binding requires one pre/post image pair per physical-prompt frame")
         frame_representations = []
+        frame_route_representations = []
         frame_masks = []
+        frame_order_masks = []
         for frame, name in enumerate(prompt_names):
             pre_tokens = self._pool_physical_prompt_image(obs, name)
             post_name = prompt_post_names[frame]
@@ -286,23 +306,47 @@ class Pi0(_model.BaseModel):
             effect_mask = jnp.logical_and(action_valid, obs.image_masks[name])
             effect_mask = jnp.logical_and(effect_mask, obs.image_masks[post_name])
             frame_representations.append(self._behavior_frame_representation(pre_tokens, post_tokens, action_token))
+            frame_route_representations.append(jnp.mean(pre_tokens, axis=1))
             frame_masks.append(effect_mask)
-        return frame_representations, frame_masks
+            order_valid = jnp.sum(obs.physical_prompt_action_mask[:, frame], axis=-1) >= 2
+            frame_order_masks.append(jnp.logical_and(effect_mask, order_valid))
+        return frame_representations, frame_route_representations, frame_masks, frame_order_masks
 
     def encode_physical_prompt_behavior_stages(self, obs: _model.Observation):
         """Encode normalized per-transition latents and their validity mask."""
         if not self.physical_prompt_behavior_latent_dim:
             raise ValueError("Physical-prompt behavior binding is disabled")
-        frame_representations, frame_masks = self._encode_physical_prompt_behavior_frames(obs)
+        frame_representations, _, frame_masks, _ = self._encode_physical_prompt_behavior_frames(obs)
         frame_latents = self.physical_prompt_behavior_down(jnp.stack(frame_representations, axis=1))
         return _safe_l2_normalize(frame_latents), jnp.stack(frame_masks, axis=1)
+
+    def encode_physical_prompt_behavior_stage_set(self, obs: _model.Observation):
+        """Encode behavior values, visual route keys, and order-sensitive masks."""
+        if not self.physical_prompt_visual_stage_routing:
+            raise ValueError("Visual stage routing is disabled")
+        frame_representations, route_representations, _, order_masks = self._encode_physical_prompt_behavior_frames(obs)
+        frame_latents = self.physical_prompt_behavior_down(jnp.stack(frame_representations, axis=1))
+        route_keys = self.physical_prompt_stage_route_down(jnp.stack(route_representations, axis=1))
+        return (
+            _safe_l2_normalize(frame_latents),
+            _safe_l2_normalize(route_keys),
+            jnp.stack(order_masks, axis=1),
+        )
 
     def encode_physical_prompt_behavior(self, obs: _model.Observation):
         """Encode a normalized behavior latent for the C3 binding objective."""
         if not self.physical_prompt_behavior_latent_dim:
             raise ValueError("Physical-prompt behavior binding is disabled")
-        frame_representations, frame_masks = self._encode_physical_prompt_behavior_frames(obs)
+        frame_representations, _, frame_masks, _ = self._encode_physical_prompt_behavior_frames(obs)
         return self._pool_behavior_frames(frame_representations, frame_masks)
+
+    def encode_query_stage_key(self, obs: _model.Observation):
+        """Encode the live pre-action state without reading query or prompt actions."""
+        if not self.physical_prompt_visual_stage_routing:
+            raise ValueError("Visual stage routing is disabled")
+        live_tokens = self._pool_physical_prompt_image(obs, "base_0_rgb")
+        route_representation = jnp.mean(live_tokens, axis=1) + self.physical_prompt_query_state_proj(obs.state)
+        return _safe_l2_normalize(self.physical_prompt_stage_route_down(route_representation))
 
     def encode_query_action_behavior(self, actions: _model.Actions, obs: _model.Observation | None = None):
         """Encode the supervised query action chunk in the same behavior space."""
@@ -330,14 +374,49 @@ class Pi0(_model.BaseModel):
         latent = self.physical_prompt_behavior_down(query_representation)
         return _safe_l2_normalize(latent)
 
-    def score_query_prompt_behavior(self, query_latent, stage_latents, stage_mask, *, temperature: float):
+    def score_query_prompt_behavior(
+        self,
+        query_latent,
+        stage_latents,
+        stage_mask,
+        *,
+        temperature: float,
+        query_stage_key=None,
+        stage_keys=None,
+    ):
         """Score a local query against a full demonstration using soft stage alignment."""
+        if self.physical_prompt_visual_stage_routing:
+            if query_stage_key is None or stage_keys is None:
+                raise ValueError("Visual stage routing requires query and demonstration route keys")
+            score, _ = _masked_routed_similarity(
+                query_latent,
+                stage_latents,
+                stage_mask,
+                query_stage_key,
+                stage_keys,
+                temperature=temperature,
+            )
+            return score
         return _masked_logmeanexp_similarity(
             query_latent,
             stage_latents,
             stage_mask,
             temperature=temperature,
         )
+
+    def physical_prompt_stage_routing_weights(self, query_stage_key, stage_keys, stage_mask, *, temperature: float):
+        """Expose action-independent route weights for diagnostics and invariance tests."""
+        dummy_query = jnp.zeros_like(query_stage_key)
+        dummy_candidates = jnp.zeros_like(stage_keys)
+        _, weights = _masked_routed_similarity(
+            dummy_query,
+            dummy_candidates,
+            stage_mask,
+            query_stage_key,
+            stage_keys,
+            temperature=temperature,
+        )
+        return weights
 
     @at.typecheck
     def embed_prefix(

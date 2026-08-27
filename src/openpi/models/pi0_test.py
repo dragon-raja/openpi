@@ -99,6 +99,15 @@ def test_behavior_binding_requires_exact_multistep_effects():
     with pytest.raises(ValueError, match="requires a behavior latent"):
         _pi0_config.Pi0Config(physical_prompt_stage_alignment=True)
 
+    with pytest.raises(ValueError, match="requires stage alignment"):
+        _pi0_config.Pi0Config(
+            physical_prompt_frames=8,
+            physical_prompt_effects=True,
+            physical_prompt_effect_horizons=(1, 2),
+            physical_prompt_behavior_latent_dim=128,
+            physical_prompt_visual_stage_routing=True,
+        )
+
 
 def test_safe_l2_normalize_has_finite_zero_vector_gradient():
     value = jnp.zeros((2, 256), dtype=jnp.float32)
@@ -132,6 +141,26 @@ def test_masked_stage_alignment_ignores_padding_and_handles_empty_sets():
             )(query)
         )
     )
+
+
+def test_visual_routing_is_independent_of_behavior_candidate_values():
+    route_query = _pi0._safe_l2_normalize(jnp.array([[1.0, 0.0]]))  # noqa: SLF001
+    route_keys = _pi0._safe_l2_normalize(jnp.array([[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]]))  # noqa: SLF001
+    query = _pi0._safe_l2_normalize(jnp.array([[1.0, 1.0]]))  # noqa: SLF001
+    forward = _pi0._safe_l2_normalize(jnp.array([[[1.0, 1.0], [1.0, -1.0], [-1.0, 0.0]]]))  # noqa: SLF001
+    reversed_values = -forward
+    mask = jnp.array([[True, True, False]])
+
+    forward_score, forward_weights = _pi0._masked_routed_similarity(  # noqa: SLF001
+        query, forward, mask, route_query, route_keys, temperature=0.1
+    )
+    reversed_score, reversed_weights = _pi0._masked_routed_similarity(  # noqa: SLF001
+        query, reversed_values, mask, route_query, route_keys, temperature=0.1
+    )
+
+    assert jnp.array_equal(forward_weights, reversed_weights)
+    assert forward_weights[0, 2] == 0.0
+    assert forward_score[0] == pytest.approx(-float(reversed_score[0]))
 
 
 def test_masked_action_flow_changes_sign_under_valid_prefix_reversal():

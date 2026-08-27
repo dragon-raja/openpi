@@ -64,6 +64,9 @@ class Pi0Config(_model.BaseModelConfig):
     # Keep one behavior latent per demonstration transition and align a local
     # query to the best compatible stage instead of averaging the full video.
     physical_prompt_stage_alignment: bool = False
+    # Route to a demonstration stage using pre-action visual state only, then
+    # verify action-effect behavior under that candidate-invariant route.
+    physical_prompt_visual_stage_routing: bool = False
     # Carry an explicit wrong-task demonstration during training.  These
     # fields are ignored by inference and only materialized by the causal
     # ranking objective.
@@ -106,6 +109,8 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("physical_prompt_query_context_binding requires a behavior latent")
         if self.physical_prompt_stage_alignment and not self.physical_prompt_behavior_latent_dim:
             raise ValueError("physical_prompt_stage_alignment requires a behavior latent")
+        if self.physical_prompt_visual_stage_routing and not self.physical_prompt_stage_alignment:
+            raise ValueError("physical_prompt_visual_stage_routing requires stage alignment")
         if self.physical_prompt_counterfactuals and not self.physical_prompt_frames:
             raise ValueError("physical_prompt_counterfactuals requires physical_prompt_frames > 0")
         if self.pytorch_compile_mode is not None:

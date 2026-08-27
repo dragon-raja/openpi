@@ -80,14 +80,37 @@ def _score_batch(model, observation, actions, stage_temperature):
         train._intervene_physical_prompt(observation, reverse_actions=True),  # noqa: SLF001
     )
     if model.physical_prompt_stage_alignment:
-        encoded = [model.encode_physical_prompt_behavior_stages(candidate) for candidate in candidates]
-        scores = [
-            model.score_query_prompt_behavior(query, stages, mask, temperature=stage_temperature)
-            for stages, mask in encoded
-        ]
-        positive_stages, positive_mask = encoded[0]
-        stage_similarity = jnp.einsum("bd,bpd->bp", query, positive_stages)
-        top_stage = jnp.argmax(jnp.where(positive_mask, stage_similarity, -jnp.inf), axis=-1)
+        if model.physical_prompt_visual_stage_routing:
+            query_stage_key = model.encode_query_stage_key(observation)
+            encoded = [model.encode_physical_prompt_behavior_stage_set(candidate) for candidate in candidates]
+            scores = [
+                model.score_query_prompt_behavior(
+                    query,
+                    stages,
+                    mask,
+                    temperature=stage_temperature,
+                    query_stage_key=query_stage_key,
+                    stage_keys=stage_keys,
+                )
+                for stages, stage_keys, mask in encoded
+            ]
+            _, positive_keys, positive_mask = encoded[0]
+            route_weights = model.physical_prompt_stage_routing_weights(
+                query_stage_key,
+                positive_keys,
+                positive_mask,
+                temperature=stage_temperature,
+            )
+            top_stage = jnp.argmax(route_weights, axis=-1)
+        else:
+            encoded = [model.encode_physical_prompt_behavior_stages(candidate) for candidate in candidates]
+            scores = [
+                model.score_query_prompt_behavior(query, stages, mask, temperature=stage_temperature)
+                for stages, mask in encoded
+            ]
+            positive_stages, positive_mask = encoded[0]
+            stage_similarity = jnp.einsum("bd,bpd->bp", query, positive_stages)
+            top_stage = jnp.argmax(jnp.where(positive_mask, stage_similarity, -jnp.inf), axis=-1)
     else:
         encoded = [model.encode_physical_prompt_behavior(candidate) for candidate in candidates]
         scores = [jnp.sum(query * candidate, axis=-1) for candidate in encoded]

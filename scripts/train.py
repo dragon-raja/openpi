@@ -264,21 +264,37 @@ def train_step(
         def behavior_binding_loss_fn(model, observation, wrong_observation, reversed_observation, actions):
             query_latent = model.encode_query_action_behavior(actions, observation)
             if model.physical_prompt_stage_alignment:
-                positive_stages, positive_mask = model.encode_physical_prompt_behavior_stages(observation)
-                wrong_stages, wrong_mask = model.encode_physical_prompt_behavior_stages(wrong_observation)
-                reversed_stages, reversed_mask = model.encode_physical_prompt_behavior_stages(reversed_observation)
+                if model.physical_prompt_visual_stage_routing:
+                    query_stage_key = model.encode_query_stage_key(observation)
+                    positive_stages, positive_keys, positive_mask = model.encode_physical_prompt_behavior_stage_set(
+                        observation
+                    )
+                    wrong_stages, wrong_keys, wrong_mask = model.encode_physical_prompt_behavior_stage_set(
+                        wrong_observation
+                    )
+                    reversed_stages, reversed_keys, reversed_mask = model.encode_physical_prompt_behavior_stage_set(
+                        reversed_observation
+                    )
+                else:
+                    query_stage_key = None
+                    positive_stages, positive_mask = model.encode_physical_prompt_behavior_stages(observation)
+                    wrong_stages, wrong_mask = model.encode_physical_prompt_behavior_stages(wrong_observation)
+                    reversed_stages, reversed_mask = model.encode_physical_prompt_behavior_stages(reversed_observation)
+                    positive_keys = wrong_keys = reversed_keys = None
 
-                def score(stages, mask):
+                def score(stages, mask, stage_keys):
                     return model.score_query_prompt_behavior(
                         query_latent,
                         stages,
                         mask,
                         temperature=config.physical_prompt_stage_alignment_temperature,
+                        query_stage_key=query_stage_key,
+                        stage_keys=stage_keys,
                     )
 
-                positive_similarity = score(positive_stages, positive_mask)
-                wrong_similarity = score(wrong_stages, wrong_mask)
-                reversed_similarity = score(reversed_stages, reversed_mask)
+                positive_similarity = score(positive_stages, positive_mask, positive_keys)
+                wrong_similarity = score(wrong_stages, wrong_mask, wrong_keys)
+                reversed_similarity = score(reversed_stages, reversed_mask, reversed_keys)
             else:
                 positive_latent = model.encode_physical_prompt_behavior(observation)
                 wrong_latent = model.encode_physical_prompt_behavior(wrong_observation)
