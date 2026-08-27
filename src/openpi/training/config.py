@@ -753,6 +753,7 @@ class TrainConfig:
     # causal objective.
     physical_prompt_behavior_bind_weight: float = 0.0
     physical_prompt_behavior_bind_temperature: float = 0.1
+    physical_prompt_stage_alignment_temperature: float = 0.05
     physical_prompt_behavior_bind_warmup_steps: int = 0
     physical_prompt_behavior_bind_ramp_steps: int = 0
 
@@ -797,6 +798,8 @@ class TrainConfig:
             raise ValueError("Physical-prompt behavior binding weight must be non-negative")
         if self.physical_prompt_behavior_bind_temperature <= 0:
             raise ValueError("Physical-prompt behavior binding temperature must be positive")
+        if self.physical_prompt_stage_alignment_temperature <= 0:
+            raise ValueError("Physical-prompt stage alignment temperature must be positive")
         if self.physical_prompt_behavior_bind_warmup_steps < 0 or self.physical_prompt_behavior_bind_ramp_steps < 0:
             raise ValueError("Physical-prompt behavior binding schedule steps must be non-negative")
         if (self.physical_prompt_counterfactual_rank_weight or self.physical_prompt_action_rank_weight) and not getattr(
@@ -1439,6 +1442,88 @@ _CONFIGS = [
         ).get_physical_prompt_freeze_filter(),
         physical_prompt_behavior_bind_weight=0.1,
         physical_prompt_behavior_bind_temperature=0.1,
+        physical_prompt_behavior_bind_warmup_steps=50,
+        physical_prompt_behavior_bind_ramp_steps=100,
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_libero_stage_aligned_behavior_binding_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            physical_prompt_frames=8,
+            physical_prompt_pool_grid=4,
+            physical_prompt_effects=True,
+            physical_prompt_effect_horizons=(1, 2, 4, 8),
+            physical_prompt_local_effect_tokens=4,
+            physical_prompt_behavior_latent_dim=256,
+            physical_prompt_directed_action_flow=True,
+            physical_prompt_cross_modal_behavior_binding=True,
+            physical_prompt_query_context_binding=True,
+            physical_prompt_stage_alignment=True,
+            physical_prompt_counterfactuals=True,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(
+                assets_dir=_pi05_libero_checkpoint_path("assets"),
+                asset_id="physical-intelligence/libero",
+            ),
+            physical_prompt_frames=8,
+            physical_prompt_seed=42,
+            physical_prompt_language="Follow the demonstrated behavior.",
+            physical_prompt_effects=True,
+            physical_prompt_effect_horizons=(1, 2, 4, 8),
+            physical_prompt_counterfactuals=True,
+            physical_prompt_hard_negatives_only=True,
+            physical_prompt_language_anchor_fraction=0.25,
+            physical_prompt_hard_pair_fraction=0.5,
+            physical_prompt_heldout_tasks=(
+                "put both the alphabet soup and the tomato sauce in the basket",
+                "put both the cream cheese box and the butter in the basket",
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=6,
+        num_workers=0,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=100,
+            peak_lr=3e-5,
+            decay_steps=300,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            _pi05_libero_checkpoint_path("params"),
+            missing_regex=".*(lora|physical_prompt).*",
+        ),
+        num_train_steps=300,
+        save_interval=150,
+        keep_period=150,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            physical_prompt_frames=8,
+            physical_prompt_pool_grid=4,
+            physical_prompt_effects=True,
+            physical_prompt_effect_horizons=(1, 2, 4, 8),
+            physical_prompt_local_effect_tokens=4,
+            physical_prompt_behavior_latent_dim=256,
+            physical_prompt_directed_action_flow=True,
+            physical_prompt_cross_modal_behavior_binding=True,
+            physical_prompt_query_context_binding=True,
+            physical_prompt_stage_alignment=True,
+            physical_prompt_counterfactuals=True,
+        ).get_physical_prompt_freeze_filter(),
+        physical_prompt_behavior_bind_weight=0.1,
+        physical_prompt_behavior_bind_temperature=0.1,
+        physical_prompt_stage_alignment_temperature=0.05,
         physical_prompt_behavior_bind_warmup_steps=50,
         physical_prompt_behavior_bind_ramp_steps=100,
         ema_decay=None,

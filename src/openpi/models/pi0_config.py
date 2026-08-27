@@ -58,6 +58,12 @@ class Pi0Config(_model.BaseModelConfig):
     # Bind the visual post-minus-pre effect to the aligned action through a
     # multiplicative gate before forming the behavior latent.
     physical_prompt_cross_modal_behavior_binding: bool = False
+    # Condition the query behavior on the current base-camera observation and
+    # robot state, in addition to the supervised action chunk.
+    physical_prompt_query_context_binding: bool = False
+    # Keep one behavior latent per demonstration transition and align a local
+    # query to the best compatible stage instead of averaging the full video.
+    physical_prompt_stage_alignment: bool = False
     # Carry an explicit wrong-task demonstration during training.  These
     # fields are ignored by inference and only materialized by the causal
     # ranking objective.
@@ -96,6 +102,10 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("physical_prompt_directed_action_flow requires a behavior latent")
         if self.physical_prompt_cross_modal_behavior_binding and not self.physical_prompt_behavior_latent_dim:
             raise ValueError("physical_prompt_cross_modal_behavior_binding requires a behavior latent")
+        if self.physical_prompt_query_context_binding and not self.physical_prompt_behavior_latent_dim:
+            raise ValueError("physical_prompt_query_context_binding requires a behavior latent")
+        if self.physical_prompt_stage_alignment and not self.physical_prompt_behavior_latent_dim:
+            raise ValueError("physical_prompt_stage_alignment requires a behavior latent")
         if self.physical_prompt_counterfactuals and not self.physical_prompt_frames:
             raise ValueError("physical_prompt_counterfactuals requires physical_prompt_frames > 0")
         if self.pytorch_compile_mode is not None:

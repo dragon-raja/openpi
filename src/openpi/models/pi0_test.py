@@ -93,6 +93,12 @@ def test_behavior_binding_requires_exact_multistep_effects():
             physical_prompt_directed_action_flow=True,
         )
 
+    with pytest.raises(ValueError, match="requires a behavior latent"):
+        _pi0_config.Pi0Config(physical_prompt_query_context_binding=True)
+
+    with pytest.raises(ValueError, match="requires a behavior latent"):
+        _pi0_config.Pi0Config(physical_prompt_stage_alignment=True)
+
 
 def test_safe_l2_normalize_has_finite_zero_vector_gradient():
     value = jnp.zeros((2, 256), dtype=jnp.float32)
@@ -101,6 +107,31 @@ def test_safe_l2_normalize_has_finite_zero_vector_gradient():
 
     assert jnp.array_equal(normalized, value)
     assert jnp.all(jnp.isfinite(gradient))
+
+
+def test_masked_stage_alignment_ignores_padding_and_handles_empty_sets():
+    query = _pi0._safe_l2_normalize(jnp.array([[1.0, 0.0], [1.0, 0.0]]))  # noqa: SLF001
+    candidates = _pi0._safe_l2_normalize(  # noqa: SLF001
+        jnp.array([[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]], [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]])
+    )
+    mask = jnp.array([[True, True, False], [False, False, False]])
+
+    score = _pi0._masked_logmeanexp_similarity(query, candidates, mask, temperature=0.1)  # noqa: SLF001
+    expected = 0.1 * (jax.nn.logsumexp(jnp.array([10.0, 0.0])) - jnp.log(2.0))
+
+    assert score[0] == pytest.approx(float(expected), abs=2e-6)
+    assert score[1] == 0.0
+    assert jnp.all(
+        jnp.isfinite(
+            jax.grad(
+                lambda q: jnp.sum(
+                    _pi0._masked_logmeanexp_similarity(  # noqa: SLF001
+                        q, candidates, mask, temperature=0.1
+                    )
+                )
+            )(query)
+        )
+    )
 
 
 def test_masked_action_flow_changes_sign_under_valid_prefix_reversal():

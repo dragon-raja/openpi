@@ -31,6 +31,16 @@ def _masked_action_flow(action_tokens, action_mask):
     return jnp.sum(differences * mask[..., None], axis=1) / denominator
 
 
+def _masked_logmeanexp_similarity(query, candidates, candidate_mask, *, temperature: float):
+    """Smoothly align each query to a variable-size set of candidate stages."""
+    similarities = jnp.einsum("bd,bpd->bp", query, candidates)
+    mask = candidate_mask.astype(bool)
+    valid_count = jnp.maximum(jnp.sum(mask, axis=-1), 1)
+    masked_logits = jnp.where(mask, similarities / temperature, -1.0e4)
+    scores = temperature * (jax.nn.logsumexp(masked_logits, axis=-1) - jnp.log(valid_count))
+    return jnp.where(jnp.any(mask, axis=-1), scores, 0.0)
+
+
 def make_attn_mask(input_mask, mask_ar):
     """Adapted from big_vision.
 
@@ -90,6 +100,8 @@ class Pi0(_model.BaseModel):
         self.physical_prompt_behavior_latent_dim = config.physical_prompt_behavior_latent_dim
         self.physical_prompt_directed_action_flow = config.physical_prompt_directed_action_flow
         self.physical_prompt_cross_modal_behavior_binding = config.physical_prompt_cross_modal_behavior_binding
+        self.physical_prompt_query_context_binding = config.physical_prompt_query_context_binding
+        self.physical_prompt_stage_alignment = config.physical_prompt_stage_alignment
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -172,6 +184,10 @@ class Pi0(_model.BaseModel):
                 self.physical_prompt_behavior_token_embedding = nnx.Param(
                     jax.random.normal(rngs.params(), (paligemma_config.width,), dtype=jnp.float32) * 0.02
                 )
+                if config.physical_prompt_query_context_binding:
+                    self.physical_prompt_query_state_proj = nnx.Linear(
+                        config.action_dim, paligemma_config.width, rngs=rngs
+                    )
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -249,16 +265,15 @@ class Pi0(_model.BaseModel):
         latent = self.physical_prompt_behavior_down(pooled)
         return _safe_l2_normalize(latent)
 
-    def encode_physical_prompt_behavior(self, obs: _model.Observation):
-        """Encode a normalized behavior latent for the C3 binding objective."""
-        if not self.physical_prompt_behavior_latent_dim:
-            raise ValueError("Physical-prompt behavior binding is disabled")
+    def _encode_physical_prompt_behavior_frames(self, obs: _model.Observation):
         prompt_names = sorted(
             name
             for name in obs.images
             if name.startswith("physical_prompt_") and not name.startswith("physical_prompt_post_")
         )
         prompt_post_names = sorted(name for name in obs.images if name.startswith("physical_prompt_post_"))
+        if len(prompt_names) != self.physical_prompt_frames or len(prompt_post_names) != self.physical_prompt_frames:
+            raise ValueError("Behavior binding requires one pre/post image pair per physical-prompt frame")
         frame_representations = []
         frame_masks = []
         for frame, name in enumerate(prompt_names):
@@ -272,9 +287,24 @@ class Pi0(_model.BaseModel):
             effect_mask = jnp.logical_and(effect_mask, obs.image_masks[post_name])
             frame_representations.append(self._behavior_frame_representation(pre_tokens, post_tokens, action_token))
             frame_masks.append(effect_mask)
+        return frame_representations, frame_masks
+
+    def encode_physical_prompt_behavior_stages(self, obs: _model.Observation):
+        """Encode normalized per-transition latents and their validity mask."""
+        if not self.physical_prompt_behavior_latent_dim:
+            raise ValueError("Physical-prompt behavior binding is disabled")
+        frame_representations, frame_masks = self._encode_physical_prompt_behavior_frames(obs)
+        frame_latents = self.physical_prompt_behavior_down(jnp.stack(frame_representations, axis=1))
+        return _safe_l2_normalize(frame_latents), jnp.stack(frame_masks, axis=1)
+
+    def encode_physical_prompt_behavior(self, obs: _model.Observation):
+        """Encode a normalized behavior latent for the C3 binding objective."""
+        if not self.physical_prompt_behavior_latent_dim:
+            raise ValueError("Physical-prompt behavior binding is disabled")
+        frame_representations, frame_masks = self._encode_physical_prompt_behavior_frames(obs)
         return self._pool_behavior_frames(frame_representations, frame_masks)
 
-    def encode_query_action_behavior(self, actions: _model.Actions):
+    def encode_query_action_behavior(self, actions: _model.Actions, obs: _model.Observation | None = None):
         """Encode the supervised query action chunk in the same behavior space."""
         if not self.physical_prompt_behavior_latent_dim:
             raise ValueError("Physical-prompt behavior binding is disabled")
@@ -284,8 +314,30 @@ class Pi0(_model.BaseModel):
             action_mask,
             self.physical_prompt_query_action_position_embedding.value,
         )
-        latent = self.physical_prompt_behavior_down(action_token)
+        query_representation = action_token
+        if self.physical_prompt_query_context_binding:
+            if obs is None:
+                raise ValueError("Query-context behavior binding requires an observation")
+            state_token = self.physical_prompt_query_state_proj(obs.state)
+            live_tokens = self._pool_physical_prompt_image(obs, "base_0_rgb")
+            attention_query = _safe_l2_normalize(action_token + state_token)
+            attention_keys = _safe_l2_normalize(live_tokens)
+            attention_logits = jnp.einsum("bd,bpd->bp", attention_query, attention_keys) / 0.1
+            attention = jax.nn.softmax(attention_logits, axis=-1)
+            visual_context = jnp.sum(live_tokens * attention[..., None], axis=1)
+            live_valid = obs.image_masks["base_0_rgb"].astype(visual_context.dtype)
+            query_representation = action_token + state_token + visual_context * live_valid[:, None]
+        latent = self.physical_prompt_behavior_down(query_representation)
         return _safe_l2_normalize(latent)
+
+    def score_query_prompt_behavior(self, query_latent, stage_latents, stage_mask, *, temperature: float):
+        """Score a local query against a full demonstration using soft stage alignment."""
+        return _masked_logmeanexp_similarity(
+            query_latent,
+            stage_latents,
+            stage_mask,
+            temperature=temperature,
+        )
 
     @at.typecheck
     def embed_prefix(

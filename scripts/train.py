@@ -262,13 +262,30 @@ def train_step(
         reversed_observation = _intervene_physical_prompt(observation, reverse_actions=True)
 
         def behavior_binding_loss_fn(model, observation, wrong_observation, reversed_observation, actions):
-            query_latent = model.encode_query_action_behavior(actions)
-            positive_latent = model.encode_physical_prompt_behavior(observation)
-            wrong_latent = model.encode_physical_prompt_behavior(wrong_observation)
-            reversed_latent = model.encode_physical_prompt_behavior(reversed_observation)
-            positive_similarity = jnp.sum(query_latent * positive_latent, axis=-1)
-            wrong_similarity = jnp.sum(query_latent * wrong_latent, axis=-1)
-            reversed_similarity = jnp.sum(query_latent * reversed_latent, axis=-1)
+            query_latent = model.encode_query_action_behavior(actions, observation)
+            if model.physical_prompt_stage_alignment:
+                positive_stages, positive_mask = model.encode_physical_prompt_behavior_stages(observation)
+                wrong_stages, wrong_mask = model.encode_physical_prompt_behavior_stages(wrong_observation)
+                reversed_stages, reversed_mask = model.encode_physical_prompt_behavior_stages(reversed_observation)
+
+                def score(stages, mask):
+                    return model.score_query_prompt_behavior(
+                        query_latent,
+                        stages,
+                        mask,
+                        temperature=config.physical_prompt_stage_alignment_temperature,
+                    )
+
+                positive_similarity = score(positive_stages, positive_mask)
+                wrong_similarity = score(wrong_stages, wrong_mask)
+                reversed_similarity = score(reversed_stages, reversed_mask)
+            else:
+                positive_latent = model.encode_physical_prompt_behavior(observation)
+                wrong_latent = model.encode_physical_prompt_behavior(wrong_observation)
+                reversed_latent = model.encode_physical_prompt_behavior(reversed_observation)
+                positive_similarity = jnp.sum(query_latent * positive_latent, axis=-1)
+                wrong_similarity = jnp.sum(query_latent * wrong_latent, axis=-1)
+                reversed_similarity = jnp.sum(query_latent * reversed_latent, axis=-1)
             logits = (
                 jnp.stack(
                     [positive_similarity, wrong_similarity, reversed_similarity],
